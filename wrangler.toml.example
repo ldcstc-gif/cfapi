@@ -1,0 +1,16 @@
+name = "one-balance"
+main = "src/index.ts"
+compatibility_date = "2025-06-20"
+
+# 如需定时刷新渠道模型（付费计划），取消下面注释
+# [triggers]
+# crons = ["0 19 * * *"]   # UTC 19:00 = 北京时间 03:00
+
+[[d1_databases]]
+binding = "DB"
+database_name = "one-balance"
+database_id = "<your-d1-database-id>"
+
+[vars]
+AUTH_KEY = "<your-admin-auth-key>"
+LOGIN_PASS = "<your-login-password>"
