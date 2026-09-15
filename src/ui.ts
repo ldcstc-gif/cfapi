@@ -132,12 +132,17 @@ async function renderChannels() {
   let html = '<div class="flex justify-between items-center mb-4"><h2 class="text-lg font-semibold">渠道管理</h2>'
     + '<button onclick="showChannelForm()" class="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700">+ 添加渠道</button></div>';
   html += '<div class="bg-white rounded-lg shadow overflow-hidden"><table class="w-full text-sm">'
-    + '<thead class="bg-gray-50"><tr><th class="p-3 text-left">ID</th><th class="p-3 text-left">名称</th><th class="p-3 text-left">前缀</th><th class="p-3 text-left">地址</th><th class="p-3 text-left">模型数</th><th class="p-3 text-left">优先级</th><th class="p-3 text-left">状态</th><th class="p-3 text-left">操作</th></tr></thead><tbody>';
+    + '<thead class="bg-gray-50"><tr><th class="p-3 text-left">ID</th><th class="p-3 text-left">名称</th><th class="p-3 text-left">前缀</th><th class="p-3 text-left">计费</th><th class="p-3 text-left">地址</th><th class="p-3 text-left">模型数</th><th class="p-3 text-left">优先级</th><th class="p-3 text-left">状态</th><th class="p-3 text-left">操作</th></tr></thead><tbody>';
   for (const ch of rows) {
     const mc = (ch.models || '').split(',').filter(Boolean).length;
     const st = ch.status === 1 ? '<span class="text-green-600">启用</span>' : '<span class="text-red-500">停用</span>';
+    const fm = ch.free_models || '';
+    const free = fm === '*' ? '<span class="px-1.5 py-0.5 rounded text-xs bg-green-100 text-green-700">全免费</span>'
+      : fm ? '<span class="px-1.5 py-0.5 rounded text-xs bg-blue-100 text-blue-700" title="' + esc(fm) + '">部分免费</span>'
+      : '<span class="px-1.5 py-0.5 rounded text-xs bg-orange-100 text-orange-700">付费</span>';
     html += '<tr class="border-t"><td class="p-3">' + ch.id + '</td><td class="p-3 font-medium">' + esc(ch.name)
       + '</td><td class="p-3 font-mono text-xs text-purple-600">' + esc(ch.prefix || '')
+      + '</td><td class="p-3">' + free
       + '</td><td class="p-3 text-gray-500 text-xs">' + esc(ch.base_url)
       + '</td><td class="p-3">' + mc + '</td><td class="p-3">' + ch.priority
       + '</td><td class="p-3">' + st
@@ -154,12 +159,13 @@ async function renderChannels() {
 }
 
 function channelFormHtml(ch) {
-  const c = ch || { name: '', prefix: '', base_url: '', api_key: '', models: '', priority: 0 };
+  const c = ch || { name: '', prefix: '', base_url: '', api_key: '', models: '', free_models: '', priority: 0 };
   const title = ch ? '编辑渠道 #' + ch.id : '添加渠道';
   return '<h3 class="text-lg font-semibold mb-4">' + title + '</h3>'
     + '<div class="space-y-3">'
     + '<div class="flex gap-3"><div class="flex-1"><label class="block text-sm text-gray-600 mb-1">名称</label><input id="f_name" class="w-full border rounded px-3 py-2" value="' + esc(c.name) + '"></div>'
     + '<div class="w-32"><label class="block text-sm text-gray-600 mb-1">前缀（自动生成）</label><input id="f_prefix" class="w-full border rounded px-3 py-2 font-mono" value="' + esc(c.prefix || '') + '" placeholder="自动"></div></div>'
+    + '<div><label class="block text-sm text-gray-600 mb-1">免费模型规则 <span class="text-gray-400 font-normal">（* = 全免费，留空 = 无免费，逗号分隔关键词 = 匹配的模型免费）</span></label><input id="f_free_models" class="w-full border rounded px-3 py-2 font-mono text-xs" value="' + esc(c.free_models || '') + '" placeholder="例: Qwen/,deepseek-ai/,THUDM/,meta-llama/"></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">Base URL</label><input id="f_base_url" class="w-full border rounded px-3 py-2" value="' + esc(c.base_url) + '" placeholder="https://api.example.com/v1"></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">API Key（多个用换行分隔）</label><textarea id="f_api_key" class="w-full border rounded px-3 py-2 h-20 font-mono text-xs">' + esc(c.api_key || '') + '</textarea></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">模型列表（逗号分隔，或添加后点同步自动拉取）</label><textarea id="f_models" class="w-full border rounded px-3 py-2 h-20 font-mono text-xs">' + esc(c.models || '') + '</textarea></div>'
@@ -177,7 +183,7 @@ window.editChannel = async (id) => {
   if (ch) showModal(channelFormHtml(ch));
 };
 window.saveChannel = async (id) => {
-  const data = { name: $('f_name').value, prefix: $('f_prefix').value, base_url: $('f_base_url').value, api_key: $('f_api_key').value, models: $('f_models').value, priority: Number($('f_priority').value) };
+  const data = { name: $('f_name').value, prefix: $('f_prefix').value, base_url: $('f_base_url').value, api_key: $('f_api_key').value, models: $('f_models').value, free_models: $('f_free_models').value.trim(), priority: Number($('f_priority').value) };
   if (id) await api('/channels/' + id, { method: 'PUT', body: JSON.stringify(data) });
   else await api('/channels', { method: 'POST', body: JSON.stringify(data) });
   closeModal(); render();
@@ -203,12 +209,13 @@ async function renderModels() {
   const strategies = r.strategies || {};
   const items = r.data || [];
   const total = r.total_models || 0;
+  const chMap = r.channelMap || {};
 
   let html = '<div class="flex justify-between items-center mb-4"><h2 class="text-lg font-semibold">智能路由 <span class="text-sm font-normal text-gray-400">(' + total + ' 模型)</span></h2>'
     + '<button onclick="syncAllChannels()" id="syncAllBtn" class="bg-green-600 text-white px-3 py-1.5 rounded text-sm hover:bg-green-700">刷新全部渠道模型</button></div>';
 
   // strategy tabs
-  html += '<div class="flex gap-2 mb-4">';
+  html += '<div class="flex flex-wrap gap-2 mb-4">';
   for (const [k, label] of Object.entries(strategies)) {
     const active = k === modelsStrategy;
     html += '<button onclick="switchStrategy(\\'' + k + '\\')" class="px-4 py-1.5 rounded-full text-sm border transition '
@@ -216,21 +223,48 @@ async function renderModels() {
   }
   html += '</div>';
 
-  // category list
+  // category list - expandable
   html += '<div class="space-y-2">';
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const badge = item.isFree
       ? '<span class="px-1.5 py-0.5 rounded text-xs bg-green-100 text-green-700">免费</span>'
       : '<span class="px-1.5 py-0.5 rounded text-xs bg-orange-100 text-orange-700">付费</span>';
     const modelName = item.selected ? esc(item.selected) : '<span class="text-gray-400">无可用模型</span>';
-    html += '<div class="bg-white rounded-lg shadow-sm border p-4 flex items-center justify-between">'
-      + '<div class="flex items-center gap-3">'
+    const chLabel = item.selected && chMap[item.selected] ? '<span class="text-xs text-purple-500 font-mono">[' + esc(chMap[item.selected]) + ']</span>' : '';
+    html += '<div class="bg-white rounded-lg shadow-sm border overflow-hidden">'
+      + '<div class="p-4 flex items-center justify-between cursor-pointer select-none" onclick="toggleCat(' + i + ')">'
+      + '<div class="flex items-center gap-3 flex-wrap">'
       + '<span class="font-medium text-gray-700 w-28">' + esc(item.label) + '</span>'
       + '<span class="font-mono text-sm text-blue-700">' + modelName + '</span>'
-      + ' ' + badge
+      + ' ' + chLabel + ' ' + badge
       + '</div>'
-      + '<span class="text-sm text-gray-400">备选 ' + item.poolSize + ' 个</span>'
+      + '<div class="flex items-center gap-3"><span class="text-sm text-gray-400">备选 ' + item.poolSize + ' 个</span><span class="text-gray-400 cat-arrow" id="arrow_' + i + '">▶</span></div>'
       + '</div>';
+    // expandable top models
+    html += '<div id="cat_' + i + '" class="hidden border-t bg-gray-50 px-4 py-2">';
+    const tops = item.topModels || [];
+    if (tops.length > 0) {
+      html += '<div class="grid gap-1">';
+      for (let j = 0; j < tops.length; j++) {
+        const tm = tops[j];
+        const isFirst = j === 0;
+        const fb = tm.isFree ? '<span class="px-1 py-0.5 rounded text-xs bg-green-100 text-green-700">免费</span>' : '<span class="px-1 py-0.5 rounded text-xs bg-orange-100 text-orange-700">付费</span>';
+        const tmCh = chMap[tm.model] ? '<span class="text-purple-500 font-mono">[' + esc(chMap[tm.model]) + ']</span>' : '';
+        html += '<div class="flex items-center gap-2 py-1 text-sm ' + (isFirst ? 'font-semibold text-blue-700' : 'text-gray-600') + '">'
+          + '<span class="w-6 text-right text-xs text-gray-400">' + (j+1) + '</span>'
+          + '<span class="font-mono text-xs">' + esc(tm.model) + '</span>'
+          + ' ' + tmCh + ' ' + fb
+          + '</div>';
+      }
+      if (item.poolSize > tops.length) {
+        html += '<div class="text-xs text-gray-400 py-1 pl-8">...还有 ' + (item.poolSize - tops.length) + ' 个备选模型</div>';
+      }
+      html += '</div>';
+    } else {
+      html += '<p class="text-sm text-gray-400">此分类无可用模型</p>';
+    }
+    html += '</div></div>';
   }
   html += '</div>';
 
@@ -245,18 +279,29 @@ async function renderModels() {
   const allModels = Object.keys(byModel).sort();
   html += '<div class="mt-6"><div class="flex justify-between items-center mb-3"><h3 class="text-base font-semibold">全部模型 (' + allModels.length + ')</h3>'
     + '<input id="modelSearch" class="border rounded px-3 py-1.5 text-sm w-64" placeholder="搜索模型..." oninput="filterModels()"></div>';
-  html += '<div id="modelList" class="bg-white rounded-lg shadow overflow-hidden"><table class="w-full text-xs">'
-    + '<thead class="bg-gray-50"><tr><th class="p-2 text-left">模型名</th><th class="p-2 text-left">渠道别名（前缀:模型）</th><th class="p-2 text-left">渠道</th></tr></thead><tbody>';
+  html += '<div id="modelList" class="bg-white rounded-lg shadow overflow-hidden max-h-96 overflow-y-auto"><table class="w-full text-xs">'
+    + '<thead class="bg-gray-50 sticky top-0"><tr><th class="p-2 text-left">模型名</th><th class="p-2 text-left">渠道别名</th><th class="p-2 text-left">渠道</th></tr></thead><tbody>';
   for (const m of allModels) {
     const channels = byModel[m];
-    const aliases = channels.filter(a => a.channel_prefix).map(a => '<span class="inline-block px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 font-mono mr-1 mb-0.5' + (a.channel_status !== 1 ? ' opacity-50 line-through' : '') + '" title="' + esc(a.channel_name) + (a.channel_status !== 1 ? ' (停用)' : '') + '">' + esc(a.channel_prefix + ':' + m) + '</span>');
+    const aliases = channels.filter(a => a.channel_prefix).map(a => '<span class="inline-block px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 font-mono mr-1 mb-0.5' + (a.channel_status !== 1 ? ' opacity-50 line-through' : '') + '">' + esc(a.channel_prefix + ':' + m) + '</span>');
     const chNames = channels.map(a => '<span class="' + (a.channel_status !== 1 ? 'text-red-400 line-through' : 'text-gray-600') + '">' + esc(a.channel_name) + '</span>').join(', ');
-    html += '<tr class="border-t model-row"><td class="p-2 font-mono">' + esc(m) + '</td><td class="p-2">' + (aliases.length ? aliases.join('') : '<span class="text-gray-300">-</span>') + '</td><td class="p-2">' + chNames + '</td></tr>';
+    html += '<tr class="border-t model-row"><td class="p-2 font-mono">' + esc(m) + '</td><td class="p-2">' + (aliases.length ? aliases.join('') : '-') + '</td><td class="p-2">' + chNames + '</td></tr>';
   }
   html += '</tbody></table></div></div>';
   $('content').innerHTML = html;
 }
 
+window.toggleCat = (i) => {
+  const el = $('cat_' + i);
+  const arrow = $('arrow_' + i);
+  if (el.classList.contains('hidden')) {
+    el.classList.remove('hidden');
+    arrow.textContent = '▼';
+  } else {
+    el.classList.add('hidden');
+    arrow.textContent = '▶';
+  }
+};
 window.filterModels = () => {
   const q = ($('modelSearch') || {}).value?.toLowerCase() || '';
   document.querySelectorAll('.model-row').forEach(row => {
@@ -276,7 +321,7 @@ window.syncAllChannels = async () => {
 };
 
 // ─── Tokens ───
-const STRATEGY_MAP = { smart: '智能自动', price: '价格优先', speed: '速度优先', success: '成功率优先' };
+const STRATEGY_MAP = { smart: '智能自动', free: '免费', price: '价格优先', speed: '速度优先', success: '成功率优先' };
 let tokenCache = [];
 async function renderTokens() {
   const r = await api('/tokens');
@@ -285,7 +330,7 @@ async function renderTokens() {
   let html = '<div class="flex justify-between items-center mb-4"><h2 class="text-lg font-semibold">令牌管理</h2>'
     + '<button onclick="showTokenForm()" class="bg-blue-600 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-700">+ 创建令牌</button></div>';
   html += '<div class="bg-white rounded-lg shadow overflow-hidden"><table class="w-full text-sm">'
-    + '<thead class="bg-gray-50"><tr><th class="p-3 text-left">ID</th><th class="p-3 text-left">名称</th><th class="p-3 text-left">Key</th><th class="p-3 text-left">策略</th><th class="p-3 text-left">固定模型</th><th class="p-3 text-left">限制模型</th><th class="p-3 text-left">状态</th><th class="p-3">操作</th></tr></thead><tbody>';
+    + '<thead class="bg-gray-50"><tr><th class="p-3 text-left">ID</th><th class="p-3 text-left">名称</th><th class="p-3 text-left">Key</th><th class="p-3 text-left">策略</th><th class="p-3 text-left">固定模型</th><th class="p-3 text-left">限制渠道</th><th class="p-3 text-left">限制模型</th><th class="p-3 text-left">备注</th><th class="p-3 text-left">状态</th><th class="p-3">操作</th></tr></thead><tbody>';
   for (const t of rows) {
     const keyDisplay = esc(t.key.slice(0, 16) + '...');
     const fullKey = esc(t.key);
@@ -296,7 +341,9 @@ async function renderTokens() {
       + '</td><td class="p-3 font-mono text-xs cursor-pointer" title="点击复制" onclick="navigator.clipboard.writeText(\\''+fullKey+'\\');this.textContent=\\'已复制!\\';setTimeout(()=>this.textContent=\\''+keyDisplay+'\\',1000)">' + keyDisplay + '</td>'
       + '<td class="p-3 text-xs">' + esc(stLabel) + '</td>'
       + '<td class="p-3">' + pinned + '</td>'
+      + '<td class="p-3 text-xs font-mono text-purple-600">' + (t.channels || '<span class="text-gray-400 font-sans">全部</span>') + '</td>'
       + '<td class="p-3 text-xs">' + (t.models || '<span class="text-gray-400">全部</span>') + '</td>'
+      + '<td class="p-3 text-xs text-gray-500 max-w-[200px] truncate" title="' + esc(t.remark || '') + '">' + esc(t.remark || '-') + '</td>'
       + '<td class="p-3">' + st + '</td>'
       + '<td class="p-3 space-x-2">'
       + '<button onclick="editToken(' + t.id + ')" class="text-blue-600 hover:underline text-xs">编辑</button>'
@@ -315,6 +362,8 @@ function tokenFormHtml(t) {
   const models = t ? (t.models || '') : '';
   const strategy = t ? (t.strategy || 'smart') : 'smart';
   const pinned = t ? (t.pinned_model || '') : '';
+  const channels = t ? (t.channels || '') : '';
+  const remark = t ? (t.remark || '') : '';
   let strategyOpts = '';
   for (const [k, label] of Object.entries(STRATEGY_MAP)) {
     strategyOpts += '<option value="' + k + '"' + (k === strategy ? ' selected' : '') + '>' + label + '</option>';
@@ -324,7 +373,9 @@ function tokenFormHtml(t) {
     + '<div><label class="block text-sm text-gray-600 mb-1">名称</label><input id="t_name" class="w-full border rounded px-3 py-2" value="' + esc(name) + '" placeholder="用途说明"></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">路由策略</label><select id="t_strategy" class="w-full border rounded px-3 py-2">' + strategyOpts + '</select></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">固定模型（留空=按策略自动路由）</label><input id="t_pinned" class="w-full border rounded px-3 py-2 font-mono text-xs" value="' + esc(pinned) + '" placeholder="例如: deepseek-chat"></div>'
+    + '<div><label class="block text-sm text-gray-600 mb-1">限制渠道 <span class="text-gray-400 font-normal">（逗号分隔渠道前缀，留空=全部渠道）</span></label><input id="t_channels" class="w-full border rounded px-3 py-2 font-mono text-xs" value="' + esc(channels) + '" placeholder="例如: or,sf（只走 OpenRouter 和 SiliconFlow）"></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">限制模型（逗号分隔，留空=全部）</label><input id="t_models" class="w-full border rounded px-3 py-2" value="' + esc(models) + '"></div>'
+    + '<div><label class="block text-sm text-gray-600 mb-1">备注</label><input id="t_remark" class="w-full border rounded px-3 py-2" value="' + esc(remark) + '" placeholder="用途说明、分配对象等"></div>'
     + '<div class="flex gap-3 pt-2">'
     + '<button onclick="saveToken(' + (isEdit ? t.id : 'null') + ')" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">' + (isEdit ? '保存' : '创建') + '</button>'
     + '<button onclick="closeModal()" class="border px-4 py-2 rounded">取消</button></div></div>';
@@ -336,7 +387,7 @@ window.editToken = (id) => {
   if (t) showModal(tokenFormHtml(t));
 };
 window.saveToken = async (id) => {
-  const data = { name: $('t_name').value, models: $('t_models').value, strategy: $('t_strategy').value, pinned_model: $('t_pinned').value };
+  const data = { name: $('t_name').value, models: $('t_models').value, strategy: $('t_strategy').value, pinned_model: $('t_pinned').value, channels: $('t_channels').value.trim(), remark: $('t_remark').value };
   if (id) {
     await api('/tokens/' + id, { method: 'PUT', body: JSON.stringify(data) });
     closeModal(); render();
@@ -352,11 +403,29 @@ window.toggleToken = async (id, st) => { await api('/tokens/' + id, { method: 'P
 window.deleteToken = async (id) => { if (confirm('确认删除令牌 #' + id + '？')) { await api('/tokens/' + id, { method: 'DELETE' }); render(); } };
 
 // ─── Routing Test ───
+let rtChannels = [], rtStrategies = {};
 async function renderRouting() {
+  const [chR, ovR] = await Promise.all([api('/channels'), api('/routing/overview?strategy=smart')]);
+  rtChannels = (chR.data || []).filter(c => c.status === 1);
+  rtStrategies = ovR.strategies || {};
+
+  let stratOpts = '<option value="">全部策略</option>';
+  for (const [k, label] of Object.entries(rtStrategies)) {
+    stratOpts += '<option value="' + k + '">' + label + '</option>';
+  }
+  let chOpts = '';
+  for (const ch of rtChannels) {
+    chOpts += '<label class="inline-flex items-center gap-1 mr-3 text-sm"><input type="checkbox" class="rt-ch-box" value="' + esc(ch.prefix) + '"><span class="font-mono text-purple-600">[' + esc(ch.prefix) + ']</span> ' + esc(ch.name) + '</label>';
+  }
+
   let html = '<h2 class="text-lg font-semibold mb-4">路由测试</h2>'
-    + '<div class="bg-white rounded-lg shadow p-4 space-y-3">'
-    + '<p class="text-sm text-gray-600">输入消息内容测试路由分类结果</p>'
-    + '<textarea id="rt_msg" class="w-full border rounded px-3 py-2 h-24" placeholder="输入测试消息..."></textarea>'
+    + '<div class="bg-white rounded-lg shadow p-5 space-y-4">'
+    + '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">'
+    + '<div><label class="block text-sm font-medium text-gray-700 mb-1">路由策略</label><select id="rt_strategy" class="w-full border rounded px-3 py-2">' + stratOpts + '</select></div>'
+    + '<div><label class="block text-sm font-medium text-gray-700 mb-1">指定模型 <span class="text-gray-400 font-normal">（留空=自动路由）</span></label><input id="rt_model" class="w-full border rounded px-3 py-2 font-mono text-xs" placeholder="例: deepseek-chat 或 or:google/gemma-3n-e4b-it:free"></div>'
+    + '</div>'
+    + '<div><label class="block text-sm font-medium text-gray-700 mb-1">限制渠道 <span class="text-gray-400 font-normal">（不勾=不限制）</span></label><div class="flex flex-wrap gap-y-2 mt-1">' + chOpts + '</div></div>'
+    + '<div><label class="block text-sm font-medium text-gray-700 mb-1">消息内容 <span class="text-gray-400 font-normal">（自动路由时用于分类）</span></label><textarea id="rt_msg" class="w-full border rounded px-3 py-2 h-24" placeholder="输入测试消息..."></textarea></div>'
     + '<button onclick="testRoute()" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 text-sm">测试路由</button>'
     + '<div id="rt_result"></div></div>';
   $('content').innerHTML = html;
@@ -364,20 +433,54 @@ async function renderRouting() {
 
 window.testRoute = async () => {
   const msg = $('rt_msg').value;
-  const r = await api('/routing/test', { method: 'POST', body: JSON.stringify({ messages: [{ role: 'user', content: msg }] }) });
-  if (r.success) {
-    let html = '<div class="mt-3 p-3 bg-gray-50 rounded text-sm">'
-      + '<p><strong>分类:</strong> <span class="text-blue-600">' + esc(r.category) + '</span></p>'
-      + '<p><strong>选中模型:</strong> <span class="text-green-600 font-mono">' + esc(r.selected || '无') + '</span></p>'
-      + '<p><strong>候选池 (' + r.pool_size + '):</strong></p>'
-      + '<div class="mt-1 flex flex-wrap gap-1">';
-    for (const m of (r.ranked || [])) {
-      const isSelected = m === r.selected;
-      html += '<span class="px-2 py-0.5 rounded text-xs ' + (isSelected ? 'bg-green-100 text-green-700 font-semibold' : 'bg-gray-100 text-gray-600') + '">' + esc(m) + '</span>';
+  const strategy = $('rt_strategy').value || 'smart';
+  const model = $('rt_model').value.trim();
+  const checkedCh = Array.from(document.querySelectorAll('.rt-ch-box:checked')).map(el => el.value);
+  const channels = checkedCh.length ? checkedCh.join(',') : '';
+
+  const payload = { messages: [{ role: 'user', content: msg }], strategy, channels: channels || undefined, model: model || undefined };
+  $('rt_result').innerHTML = '<p class="text-gray-400 text-sm">测试中...</p>';
+  const r = await api('/routing/test', { method: 'POST', body: JSON.stringify(payload) });
+  if (!r.success) { $('rt_result').innerHTML = '<p class="text-red-500 text-sm">测试失败</p>'; return; }
+
+  const catLabel = r.category && r.category !== '-' ? (rtStrategies._cats || {})[r.category] || r.category : '(指定模型)';
+  const stLabel = rtStrategies[r.strategy] || r.strategy;
+  const freeBadge = r.selectedIsFree
+    ? '<span class="px-1.5 py-0.5 rounded text-xs bg-green-100 text-green-700">免费</span>'
+    : '<span class="px-1.5 py-0.5 rounded text-xs bg-orange-100 text-orange-700">付费</span>';
+  const chInfo = r.channel
+    ? '<span class="font-mono text-purple-600">[' + esc(r.channel.prefix) + ']</span> ' + esc(r.channel.name) + ' <span class="text-gray-400">#' + r.channel.id + '</span>'
+    : '<span class="text-red-500">无可用渠道</span>';
+
+  let html = '<div class="mt-2 rounded-lg border overflow-hidden">'
+    + '<div class="bg-blue-50 p-4 space-y-2">'
+    + '<div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">'
+    + '<div><span class="text-gray-500">策略</span><div class="font-medium">' + esc(stLabel) + '</div></div>'
+    + '<div><span class="text-gray-500">分类</span><div class="font-medium">' + esc(catLabel) + '</div></div>'
+    + '<div><span class="text-gray-500">渠道限制</span><div class="font-medium">' + (r.channels.length ? r.channels.map(c => '<span class="font-mono text-purple-600">' + esc(c) + '</span>').join(', ') : '无') + '</div></div>'
+    + '<div><span class="text-gray-500">候选池</span><div class="font-medium">' + r.pool_size + ' 个模型</div></div>'
+    + '</div>'
+    + '<div class="border-t border-blue-200 pt-3 mt-2">'
+    + '<div class="flex items-center gap-2 flex-wrap"><span class="text-gray-500 text-sm">选中:</span><span class="font-mono text-blue-700 font-semibold">' + esc(r.selected || '无') + '</span> ' + (r.selected ? freeBadge : '') + '</div>'
+    + '<div class="flex items-center gap-2 flex-wrap mt-1"><span class="text-gray-500 text-sm">渠道:</span>' + chInfo + '</div>'
+    + '</div></div>';
+
+  if (r.ranked && r.ranked.length > 0) {
+    html += '<div class="p-4"><p class="text-sm font-medium text-gray-700 mb-2">候选排名 (Top ' + r.ranked.length + ')</p>'
+      + '<div class="grid gap-1">';
+    for (let i = 0; i < r.ranked.length; i++) {
+      const m = r.ranked[i];
+      const isFirst = i === 0;
+      const fb = m.isFree ? '<span class="px-1 py-0.5 rounded text-xs bg-green-100 text-green-700">免费</span>' : '<span class="px-1 py-0.5 rounded text-xs bg-orange-100 text-orange-700">付费</span>';
+      html += '<div class="flex items-center gap-2 py-1 text-sm ' + (isFirst ? 'font-semibold text-blue-700' : 'text-gray-600') + '">'
+        + '<span class="w-6 text-right text-xs text-gray-400">' + (i+1) + '</span>'
+        + '<span class="font-mono text-xs">' + esc(m.model) + '</span> ' + fb
+        + '</div>';
     }
     html += '</div></div>';
-    $('rt_result').innerHTML = html;
   }
+  html += '</div>';
+  $('rt_result').innerHTML = html;
 };
 
 // ─── Logs ───

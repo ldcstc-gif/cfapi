@@ -142,17 +142,17 @@ async function generateUniquePrefix(db: D1Database, name: string, excludeId?: nu
 
 admin.get('/api/channels', async (c) => {
   const rows = await c.env.DB.prepare(
-    "SELECT id, name, COALESCE(prefix,'') as prefix, base_url, api_key, models, status, priority, created_at, updated_at FROM channels ORDER BY id"
+    "SELECT id, name, COALESCE(prefix,'') as prefix, base_url, api_key, models, COALESCE(free_models,'') as free_models, status, priority, created_at, updated_at FROM channels ORDER BY id"
   ).all<Channel>()
   return c.json({ success: true, data: rows.results })
 })
 
 admin.post('/api/channels', async (c) => {
-  const body = await c.req.json<{ name: string; base_url: string; api_key: string; models: string; prefix?: string; priority?: number }>()
+  const body = await c.req.json<{ name: string; base_url: string; api_key: string; models: string; prefix?: string; free_models?: string; priority?: number }>()
   const prefix = body.prefix || await generateUniquePrefix(c.env.DB, body.name)
   const result = await c.env.DB.prepare(
-    'INSERT INTO channels (name, prefix, base_url, api_key, models, priority) VALUES (?, ?, ?, ?, ?, ?)'
-  ).bind(body.name, prefix, body.base_url, body.api_key, body.models || '', body.priority || 0).run()
+    'INSERT INTO channels (name, prefix, base_url, api_key, models, free_models, priority) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(body.name, prefix, body.base_url, body.api_key, body.models || '', body.free_models || '', body.priority || 0).run()
   const channelId = result.meta.last_row_id
   if (body.models) await syncAbilities(c.env.DB, channelId, body.models)
   return c.json({ success: true, id: channelId, prefix })
@@ -168,6 +168,7 @@ admin.put('/api/channels/:id', async (c) => {
   if (body.base_url !== undefined) { sets.push('base_url = ?'); vals.push(body.base_url) }
   if (body.api_key !== undefined) { sets.push('api_key = ?'); vals.push(body.api_key) }
   if (body.models !== undefined) { sets.push('models = ?'); vals.push(body.models) }
+  if ((body as any).free_models !== undefined) { sets.push('free_models = ?'); vals.push((body as any).free_models) }
   if (body.status !== undefined) { sets.push('status = ?'); vals.push(body.status) }
   if (body.priority !== undefined) { sets.push('priority = ?'); vals.push(body.priority) }
   sets.push('updated_at = unixepoch()')
@@ -229,23 +230,23 @@ admin.post('/api/channels/:id/sync-models', async (c) => {
 
 admin.get('/api/tokens', async (c) => {
   const rows = await c.env.DB.prepare(
-    "SELECT id, name, key, status, models, COALESCE(strategy,'smart') as strategy, COALESCE(pinned_model,'') as pinned_model, created_at FROM tokens ORDER BY id"
+    "SELECT id, name, key, status, models, COALESCE(strategy,'smart') as strategy, COALESCE(pinned_model,'') as pinned_model, COALESCE(channels,'') as channels, COALESCE(remark,'') as remark, created_at FROM tokens ORDER BY id"
   ).all()
   return c.json({ success: true, data: rows.results })
 })
 
 admin.post('/api/tokens', async (c) => {
-  const body = await c.req.json<{ name: string; models?: string; strategy?: string; pinned_model?: string }>()
+  const body = await c.req.json<{ name: string; models?: string; strategy?: string; pinned_model?: string; channels?: string; remark?: string }>()
   const key = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '').slice(0, 16)
   await c.env.DB.prepare(
-    'INSERT INTO tokens (name, key, models, strategy, pinned_model) VALUES (?, ?, ?, ?, ?)'
-  ).bind(body.name || '', key, body.models || '', body.strategy || 'smart', body.pinned_model || '').run()
+    'INSERT INTO tokens (name, key, models, strategy, pinned_model, channels, remark) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(body.name || '', key, body.models || '', body.strategy || 'smart', body.pinned_model || '', body.channels || '', body.remark || '').run()
   return c.json({ success: true, key })
 })
 
 admin.put('/api/tokens/:id', async (c) => {
   const id = Number(c.req.param('id'))
-  const body = await c.req.json<{ name?: string; status?: number; models?: string; strategy?: string; pinned_model?: string }>()
+  const body = await c.req.json<{ name?: string; status?: number; models?: string; strategy?: string; pinned_model?: string; channels?: string }>()
   const sets: string[] = []
   const vals: any[] = []
   if (body.name !== undefined) { sets.push('name = ?'); vals.push(body.name) }
@@ -253,6 +254,8 @@ admin.put('/api/tokens/:id', async (c) => {
   if (body.models !== undefined) { sets.push('models = ?'); vals.push(body.models) }
   if (body.strategy !== undefined) { sets.push('strategy = ?'); vals.push(body.strategy) }
   if (body.pinned_model !== undefined) { sets.push('pinned_model = ?'); vals.push(body.pinned_model) }
+  if (body.channels !== undefined) { sets.push('channels = ?'); vals.push(body.channels) }
+  if ((body as any).remark !== undefined) { sets.push('remark = ?'); vals.push((body as any).remark) }
   if (!sets.length) return c.json({ success: true })
   vals.push(id)
   await c.env.DB.prepare(`UPDATE tokens SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run()
@@ -297,29 +300,69 @@ admin.get('/api/routing/overview', async (c) => {
   const strategy = c.req.query('strategy') || 'smart'
   const config = await getConfig(c.env.DB)
   const enabledModels = await getEnabledModels(c.env.DB)
-  const freeModels = getFreeModels(enabledModels, config)
+  const freeModels = await getFreeModels(c.env.DB)
   const overview = getCategoryOverview(enabledModels, config, strategy, freeModels)
+  const chRows = await c.env.DB.prepare(
+    `SELECT a.model, COALESCE(c.prefix,'') as prefix, c.name as ch_name
+     FROM abilities a JOIN channels c ON a.channel_id = c.id
+     WHERE a.enabled = 1 AND c.status = 1
+     ORDER BY a.priority DESC, c.priority DESC`
+  ).all<{ model: string; prefix: string; ch_name: string }>()
+  const channelMap: Record<string, string> = {}
+  for (const r of chRows.results) {
+    if (!channelMap[r.model]) channelMap[r.model] = r.prefix || r.ch_name
+  }
   return c.json({
     success: true,
     strategy,
     strategies: STRATEGY_LABELS,
     categories: CATEGORY_LABELS,
     data: overview,
+    channelMap,
     total_models: enabledModels.length,
   })
 })
 
 admin.post('/api/routing/test', async (c) => {
-  const body = await c.req.json<{ messages: any[] }>()
+  const body = await c.req.json<{ messages: any[]; strategy?: string; channels?: string; model?: string }>()
   const config = await getConfig(c.env.DB)
-  const enabledModels = await getEnabledModels(c.env.DB)
-  const { classify, resolveModel, categoryPool, rankModels, getFreeModels: gfm } = await import('./routing')
-  const freeModels = gfm(enabledModels, config)
-  const category = classify(body.messages || [], config)
-  const pool = categoryPool(category, enabledModels, config)
-  const ranked = rankModels(category, pool, config, 'smart', freeModels)
-  const selected = ranked[0] || null
-  return c.json({ success: true, category, pool_size: pool.length, ranked: ranked.slice(0, 10), selected })
+  const chFilter = body.channels ? body.channels.split(',').map(s => s.trim()).filter(Boolean) : undefined
+  const enabledModels = await getEnabledModels(c.env.DB, chFilter)
+  const freeModels = await getFreeModels(c.env.DB, chFilter)
+  const strategy = body.strategy || 'smart'
+  const { classify, categoryPool, rankModels, selectChannel } = await import('./routing')
+
+  let category = ''
+  let ranked: string[] = []
+  let selected: string | null = null
+
+  if (body.model) {
+    selected = body.model
+    category = '-'
+  } else {
+    category = classify(body.messages || [], config)
+    const pool = categoryPool(category, enabledModels, config)
+    ranked = rankModels(category, pool, config, strategy, freeModels)
+    selected = ranked[0] || null
+  }
+
+  let channelInfo: { id: number; name: string; prefix: string } | null = null
+  if (selected) {
+    const ch = await selectChannel(c.env.DB, selected, chFilter)
+    if (ch) channelInfo = { id: ch.id, name: ch.name, prefix: ch.prefix }
+  }
+
+  const rankedDetail = ranked.slice(0, 20).map(m => ({
+    model: m,
+    isFree: freeModels.has(m),
+  }))
+
+  return c.json({
+    success: true, category, strategy, channels: chFilter || [],
+    pool_size: ranked.length, ranked: rankedDetail, selected,
+    selectedIsFree: selected ? freeModels.has(selected) : false,
+    channel: channelInfo,
+  })
 })
 
 // ─── Sync all channels ───
@@ -368,9 +411,9 @@ admin.get('/api/stats', async (c) => {
 
 admin.post('/api/init', async (c) => {
   const sql = `
-    CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, models TEXT DEFAULT '', prefix TEXT DEFAULT '', status INTEGER DEFAULT 1, priority INTEGER DEFAULT 0, created_at INTEGER DEFAULT (unixepoch()), updated_at INTEGER DEFAULT (unixepoch()));
+    CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, models TEXT DEFAULT '', prefix TEXT DEFAULT '', free_models TEXT DEFAULT '', status INTEGER DEFAULT 1, priority INTEGER DEFAULT 0, created_at INTEGER DEFAULT (unixepoch()), updated_at INTEGER DEFAULT (unixepoch()));
     CREATE TABLE IF NOT EXISTS abilities (model TEXT NOT NULL, channel_id INTEGER NOT NULL, enabled INTEGER DEFAULT 1, priority INTEGER DEFAULT 0, PRIMARY KEY (model, channel_id));
-    CREATE TABLE IF NOT EXISTS tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', key TEXT UNIQUE NOT NULL, status INTEGER DEFAULT 1, models TEXT DEFAULT '', strategy TEXT DEFAULT 'smart', pinned_model TEXT DEFAULT '', created_at INTEGER DEFAULT (unixepoch()));
+    CREATE TABLE IF NOT EXISTS tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', key TEXT UNIQUE NOT NULL, status INTEGER DEFAULT 1, models TEXT DEFAULT '', strategy TEXT DEFAULT 'smart', pinned_model TEXT DEFAULT '', channels TEXT DEFAULT '', remark TEXT DEFAULT '', created_at INTEGER DEFAULT (unixepoch()));
     CREATE TABLE IF NOT EXISTS cooldowns (channel_id INTEGER NOT NULL, model TEXT NOT NULL, until_ts INTEGER NOT NULL, PRIMARY KEY (channel_id, model));
     CREATE TABLE IF NOT EXISTS request_log (id INTEGER PRIMARY KEY AUTOINCREMENT, token_name TEXT, path TEXT, model_asked TEXT, model_used TEXT, channel_id INTEGER, channel_name TEXT, status_code INTEGER, latency_ms INTEGER, error TEXT, created_at INTEGER DEFAULT (unixepoch()));
     CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -383,10 +426,17 @@ admin.post('/api/init', async (c) => {
     "ALTER TABLE tokens ADD COLUMN strategy TEXT DEFAULT 'smart'",
     "ALTER TABLE tokens ADD COLUMN pinned_model TEXT DEFAULT ''",
     "ALTER TABLE channels ADD COLUMN prefix TEXT DEFAULT ''",
+    "ALTER TABLE channels ADD COLUMN free_models TEXT DEFAULT ''",
+    "ALTER TABLE tokens ADD COLUMN channels TEXT DEFAULT ''",
+    "ALTER TABLE tokens ADD COLUMN remark TEXT DEFAULT ''",
   ]
   for (const m of migrations) {
     try { await c.env.DB.prepare(m).run() } catch { /* already exists */ }
   }
+  // migrate old is_free flag to free_models
+  try {
+    await c.env.DB.prepare("UPDATE channels SET free_models = '*' WHERE is_free = 1 AND (free_models IS NULL OR free_models = '')").run()
+  } catch { /* is_free column may not exist on fresh db */ }
   // auto-generate prefixes for channels that don't have one
   const channels = await c.env.DB.prepare("SELECT id, name, COALESCE(prefix,'') as prefix FROM channels").all<{ id: number; name: string; prefix: string }>()
   for (const ch of channels.results) {

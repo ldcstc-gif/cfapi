@@ -11,6 +11,7 @@ export interface Channel {
   base_url: string
   api_key: string
   models: string
+  free_models: string
   status: number
   priority: number
   created_at: number
@@ -32,6 +33,8 @@ export interface Token {
   models: string
   strategy: string
   pinned_model: string
+  channels: string
+  remark: string
   created_at: number
 }
 
@@ -68,4 +71,5 @@ export interface CategoryOverviewItem {
   selected: string | null
   isFree: boolean
   poolSize: number
+  topModels: Array<{ model: string; isFree: boolean }>
 }

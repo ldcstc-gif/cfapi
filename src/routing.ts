@@ -20,6 +20,7 @@ export const CATEGORY_ORDER = [
 
 export const STRATEGY_LABELS: Record<string, string> = {
   smart: '智能自动',
+  free: '免费',
   price: '价格优先',
   speed: '速度优先',
   success: '成功率优先',
@@ -134,19 +135,40 @@ export async function saveConfig(db: D1Database, config: CategoryConfig): Promis
 
 // ─── Model queries ───
 
-export async function getEnabledModels(db: D1Database): Promise<string[]> {
+export async function getEnabledModels(db: D1Database, channelPrefixes?: string[]): Promise<string[]> {
+  if (channelPrefixes?.length) {
+    const ph = channelPrefixes.map(() => '?').join(',')
+    const rows = await db.prepare(
+      `SELECT DISTINCT a.model FROM abilities a JOIN channels c ON a.channel_id = c.id WHERE c.status = 1 AND a.enabled = 1 AND c.prefix IN (${ph})`
+    ).bind(...channelPrefixes).all<{ model: string }>()
+    return rows.results.map(r => r.model)
+  }
   const rows = await db.prepare(
     'SELECT DISTINCT a.model FROM abilities a JOIN channels c ON a.channel_id = c.id WHERE c.status = 1 AND a.enabled = 1'
   ).all<{ model: string }>()
   return rows.results.map(r => r.model)
 }
 
-export function getFreeModels(enabledModels: string[], config: CategoryConfig): Set<string> {
-  const patterns = config.paidPatterns || []
+export async function getFreeModels(db: D1Database, channelPrefixes?: string[]): Promise<Set<string>> {
+  let sql = `SELECT DISTINCT a.model, COALESCE(c.free_models,'') as free_models FROM abilities a
+     JOIN channels c ON a.channel_id = c.id
+     WHERE c.status = 1 AND a.enabled = 1`
+  const binds: string[] = []
+  if (channelPrefixes?.length) {
+    sql += ` AND c.prefix IN (${channelPrefixes.map(() => '?').join(',')})`
+    binds.push(...channelPrefixes)
+  }
+  const rows = await db.prepare(sql).bind(...binds).all<{ model: string; free_models: string }>()
   const free = new Set<string>()
-  for (const m of enabledModels) {
-    const isPaid = patterns.some(p => m.toLowerCase().includes(p.toLowerCase()))
-    if (!isPaid) free.add(m)
+  for (const r of rows.results) {
+    if (r.model.endsWith(':free')) { free.add(r.model); continue }
+    if (r.free_models === '*') { free.add(r.model); continue }
+    if (r.free_models) {
+      const patterns = r.free_models.split(',').map(p => p.trim()).filter(Boolean)
+      if (patterns.some(p => r.model.toLowerCase().includes(p.toLowerCase()))) {
+        free.add(r.model)
+      }
+    }
   }
   return free
 }
@@ -209,7 +231,16 @@ export function rankModels(
     return [2, 0]
   }
 
-  const sorted = [...pool]
+  let sorted = [...pool]
+
+  if (strategy === 'free') {
+    sorted = sorted.filter(m => freeModels.has(m))
+    sorted.sort((a, b) => {
+      const [ar, ai] = fit(a), [br, bi] = fit(b)
+      return ar !== br ? ar - br : ai - bi
+    })
+    return sorted
+  }
 
   if (strategy === 'price') {
     sorted.sort((a, b) => {
@@ -297,28 +328,37 @@ export function getCategoryOverview(
     const pool = categoryPool(key, enabledModels, config)
     const ranked = pool.length ? rankModels(key, pool, config, strategy, freeModels) : []
     const selected = ranked[0] || null
+    const topModels = ranked.slice(0, 10).map(m => ({
+      model: m,
+      isFree: freeModels.has(m),
+    }))
     return {
       key,
       label: CATEGORY_LABELS[key] || key,
       selected,
       isFree: selected ? freeModels.has(selected) : true,
       poolSize: pool.length,
+      topModels,
     }
   })
 }
 
 // ─── Channel selection ───
 
-export async function selectChannel(db: D1Database, model: string): Promise<Channel | null> {
+export async function selectChannel(db: D1Database, model: string, channelPrefixes?: string[]): Promise<Channel | null> {
   const now = Math.floor(Date.now() / 1000)
-  const row = await db.prepare(`
+  let sql = `
     SELECT c.* FROM channels c
     JOIN abilities a ON a.channel_id = c.id
     LEFT JOIN cooldowns cd ON cd.channel_id = c.id AND cd.model = ?1 AND cd.until_ts > ?2
-    WHERE a.model = ?1 AND c.status = 1 AND a.enabled = 1
-    ORDER BY (cd.until_ts IS NULL) DESC, a.priority DESC, c.priority DESC
-    LIMIT 1
-  `).bind(model, now).first<Channel>()
+    WHERE a.model = ?1 AND c.status = 1 AND a.enabled = 1`
+  const binds: any[] = [model, now]
+  if (channelPrefixes?.length) {
+    sql += ` AND c.prefix IN (${channelPrefixes.map(() => '?').join(',')})`
+    binds.push(...channelPrefixes)
+  }
+  sql += ` ORDER BY (cd.until_ts IS NULL) DESC, a.priority DESC, c.priority DESC LIMIT 1`
+  const row = await db.prepare(sql).bind(...binds).first<Channel>()
   return row || null
 }
 

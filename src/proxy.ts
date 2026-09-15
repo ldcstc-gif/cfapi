@@ -12,21 +12,19 @@ interface TokenInfo {
   models: string
   strategy: string
   pinned_model: string
+  channels: string
 }
 
 async function authenticateToken(db: D1Database, authHeader: string): Promise<TokenInfo | null> {
   if (!authHeader.startsWith('Bearer ')) return null
   const raw = authHeader.slice(7).trim()
   if (!raw) return null
-  const row = await db.prepare(
-    "SELECT name, models, COALESCE(strategy,'smart') as strategy, COALESCE(pinned_model,'') as pinned_model FROM tokens WHERE key = ? AND status = 1"
-  ).bind(raw).first<TokenInfo>()
+  const sql = "SELECT name, models, COALESCE(strategy,'smart') as strategy, COALESCE(pinned_model,'') as pinned_model, COALESCE(channels,'') as channels FROM tokens WHERE key = ? AND status = 1"
+  const row = await db.prepare(sql).bind(raw).first<TokenInfo>()
   if (row) return row
   const stripped = raw.startsWith('sk-') ? raw.slice(3) : null
   if (stripped) {
-    return await db.prepare(
-      "SELECT name, models, COALESCE(strategy,'smart') as strategy, COALESCE(pinned_model,'') as pinned_model FROM tokens WHERE key = ? AND status = 1"
-    ).bind(stripped).first<TokenInfo>()
+    return await db.prepare(sql).bind(stripped).first<TokenInfo>()
   }
   return null
 }
@@ -124,6 +122,8 @@ proxy.all('/v1/*', async (c) => {
   const token = await authenticateToken(db, c.req.header('Authorization') || '')
   if (!token) return c.json({ error: { message: '未提供令牌或令牌无效', type: 'auth_error' } }, 401)
 
+  const chFilter = token.channels ? token.channels.split(',').map(c => c.trim()).filter(Boolean) : undefined
+
   const body = await c.req.arrayBuffer()
   let bodyData: any = null
   try {
@@ -137,13 +137,12 @@ proxy.all('/v1/*', async (c) => {
   let category: string | null = null
 
   if (isAuto) {
-    // Token-level pinned model takes priority
     if (token.pinned_model) {
       targetModel = token.pinned_model
     } else {
       const config = await getConfig(db)
-      const enabledModels = await getEnabledModels(db)
-      const freeModels = getFreeModels(enabledModels, config)
+      const enabledModels = await getEnabledModels(db, chFilter)
+      const freeModels = await getFreeModels(db, chFilter)
       const strategy = token.strategy || 'smart'
       const pick = pickModel(path, bodyData, enabledModels, config, strategy, freeModels)
       targetModel = pick.model || ''
@@ -176,7 +175,7 @@ proxy.all('/v1/*', async (c) => {
     }
   }
 
-  const channel = forcedChannel || await selectChannel(db, targetModel)
+  const channel = forcedChannel || await selectChannel(db, targetModel, chFilter)
   if (!channel) {
     return c.json({ error: { message: `没有渠道提供模型 ${targetModel}`, type: 'routing_error' } }, 503)
   }
@@ -186,7 +185,7 @@ proxy.all('/v1/*', async (c) => {
 
   if (resp.status === 429) {
     c.executionCtx.waitUntil(setCooldown(db, channel.id, targetModel, 60))
-    const retryChannel = forcedChannel ? null : await selectChannel(db, targetModel)
+    const retryChannel = forcedChannel ? null : await selectChannel(db, targetModel, chFilter)
     if (retryChannel && retryChannel.id !== channel.id) {
       const retryResp = await forwardToChannel(c.req.raw, retryChannel, path, body, injectModel)
       const latency = Date.now() - started
