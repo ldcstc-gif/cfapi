@@ -407,6 +407,81 @@ admin.get('/api/stats', async (c) => {
   })
 })
 
+// ─── Dashboard ───
+
+admin.get('/api/dashboard', async (c) => {
+  const db = c.env.DB
+  const now = Math.floor(Date.now() / 1000)
+  const today0 = now - (now % 86400)
+  const h24 = now - 86400
+
+  const [channels, models, tokens, totalReqs, todayReqs, cooldowns, errorsToday, avgLatency] = await Promise.all([
+    db.prepare('SELECT COUNT(*) as n FROM channels WHERE status = 1').first<{ n: number }>(),
+    db.prepare('SELECT COUNT(DISTINCT model) as n FROM abilities a JOIN channels c ON a.channel_id = c.id WHERE c.status = 1 AND a.enabled = 1').first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) as n FROM tokens WHERE status = 1').first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) as n FROM request_log').first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) as n FROM request_log WHERE created_at >= ?').bind(today0).first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) as n FROM cooldowns WHERE until_ts > ?').bind(now).first<{ n: number }>(),
+    db.prepare('SELECT COUNT(*) as n FROM request_log WHERE created_at >= ? AND status_code >= 400').bind(today0).first<{ n: number }>(),
+    db.prepare('SELECT AVG(latency_ms) as v FROM request_log WHERE created_at >= ?').bind(h24).first<{ v: number }>(),
+  ])
+
+  const topModels = await db.prepare(
+    `SELECT model_used as model, COUNT(*) as cnt, AVG(latency_ms) as avg_ms,
+       SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) as ok
+     FROM request_log WHERE created_at >= ? AND model_used != ''
+     GROUP BY model_used ORDER BY cnt DESC LIMIT 10`
+  ).bind(h24).all<{ model: string; cnt: number; avg_ms: number; ok: number }>()
+
+  const topTokens = await db.prepare(
+    `SELECT token_name, COUNT(*) as cnt,
+       SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) as ok
+     FROM request_log WHERE created_at >= ? AND token_name != ''
+     GROUP BY token_name ORDER BY cnt DESC LIMIT 10`
+  ).bind(h24).all<{ token_name: string; cnt: number; ok: number }>()
+
+  const channelStats = await db.prepare(
+    `SELECT channel_name, COUNT(*) as cnt,
+       SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) as ok,
+       AVG(latency_ms) as avg_ms
+     FROM request_log WHERE created_at >= ? AND channel_name != ''
+     GROUP BY channel_name ORDER BY cnt DESC`
+  ).bind(h24).all<{ channel_name: string; cnt: number; ok: number; avg_ms: number }>()
+
+  const recentLogs = await db.prepare(
+    'SELECT * FROM request_log ORDER BY id DESC LIMIT 15'
+  ).all()
+
+  const hourly = await db.prepare(
+    `SELECT (created_at - ?) / 3600 as h, COUNT(*) as cnt,
+       SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) as errs
+     FROM request_log WHERE created_at >= ?
+     GROUP BY h ORDER BY h`
+  ).bind(h24, h24).all<{ h: number; cnt: number; errs: number }>()
+
+  const lastSync = await db.prepare("SELECT value FROM config WHERE key = 'last_sync'").first<{ value: string }>()
+
+  return c.json({
+    success: true,
+    stats: {
+      channels: channels?.n || 0,
+      models: models?.n || 0,
+      tokens: tokens?.n || 0,
+      totalReqs: totalReqs?.n || 0,
+      todayReqs: todayReqs?.n || 0,
+      cooldowns: cooldowns?.n || 0,
+      errorsToday: errorsToday?.n || 0,
+      avgLatency: Math.round(avgLatency?.v || 0),
+    },
+    topModels: topModels.results,
+    topTokens: topTokens.results,
+    channelStats: channelStats.results,
+    recentLogs: recentLogs.results,
+    hourly: hourly.results,
+    lastSync: lastSync ? JSON.parse(lastSync.value) : null,
+  })
+})
+
 // ─── DB Init ───
 
 admin.post('/api/init', async (c) => {

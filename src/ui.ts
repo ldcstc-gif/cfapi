@@ -71,7 +71,8 @@ export function adminPage(): string {
     </div>
   </div>
   <div class="border-b mb-4 flex gap-6 text-sm">
-    <button class="tab pb-2 tab-active" data-tab="channels">渠道</button>
+    <button class="tab pb-2 tab-active" data-tab="dashboard">主页</button>
+    <button class="tab pb-2" data-tab="channels">渠道</button>
     <button class="tab pb-2" data-tab="models">模型</button>
     <button class="tab pb-2" data-tab="tokens">令牌</button>
     <button class="tab pb-2" data-tab="routing">路由测试</button>
@@ -94,7 +95,7 @@ const api = (path, opts = {}) => fetch('/admin/api' + path, { headers: H, creden
   return r.json();
 });
 
-let currentTab = 'channels';
+let currentTab = 'dashboard';
 
 document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -510,10 +511,154 @@ async function renderLogs() {
 }
 window.clearLogs = async () => { if (confirm('清空所有日志？')) { await api('/logs', { method: 'DELETE' }); render(); } };
 
+// ─── Dashboard ───
+async function renderDashboard() {
+  $('content').innerHTML = '<p class="text-gray-400 text-sm">加载中...</p>';
+  const r = await api('/dashboard');
+  if (!r.success) { $('content').innerHTML = '<p class="text-red-500">加载失败</p>'; return; }
+  const s = r.stats;
+  const syncInfo = r.lastSync ? '上次同步: ' + (r.lastSync.time || '').replace('T',' ').slice(0,19) + ' (成功 ' + r.lastSync.synced + ' / 失败 ' + r.lastSync.failed + ')' : '尚未同步';
+
+  let html = '<div class="space-y-6">';
+
+  // stat cards
+  html += '<div class="grid grid-cols-2 md:grid-cols-4 gap-4">';
+  const cards = [
+    { label: '活跃渠道', val: s.channels, color: 'blue', icon: '🔗' },
+    { label: '可用模型', val: s.models, color: 'purple', icon: '🤖' },
+    { label: '活跃令牌', val: s.tokens, color: 'green', icon: '🔑' },
+    { label: '总请求', val: s.totalReqs, color: 'gray', icon: '📊' },
+    { label: '今日请求', val: s.todayReqs, color: 'blue', icon: '📈' },
+    { label: '今日错误', val: s.errorsToday, color: s.errorsToday > 0 ? 'red' : 'green', icon: '⚠️' },
+    { label: '平均延迟(24h)', val: s.avgLatency + 'ms', color: 'orange', icon: '⏱️' },
+    { label: '冷却中', val: s.cooldowns, color: s.cooldowns > 0 ? 'orange' : 'green', icon: '❄️' },
+  ];
+  for (const c of cards) {
+    html += '<div class="bg-white rounded-lg shadow-sm border p-4">'
+      + '<div class="text-xs text-gray-500 mb-1">' + c.icon + ' ' + c.label + '</div>'
+      + '<div class="text-2xl font-bold text-' + c.color + '-600">' + c.val + '</div></div>';
+  }
+  html += '</div>';
+
+  // sync info
+  html += '<div class="text-xs text-gray-400">' + esc(syncInfo) + '</div>';
+
+  // 24h hourly chart (simple bar)
+  const hourly = r.hourly || [];
+  if (hourly.length > 0) {
+    const maxCnt = Math.max(...hourly.map(h => h.cnt), 1);
+    html += '<div class="bg-white rounded-lg shadow-sm border p-4">'
+      + '<h3 class="text-sm font-semibold text-gray-700 mb-3">24小时请求趋势</h3>'
+      + '<div class="flex items-end gap-1 h-24">';
+    for (let i = 0; i < 24; i++) {
+      const item = hourly.find(h => h.h === i);
+      const cnt = item ? item.cnt : 0;
+      const errs = item ? item.errs : 0;
+      const pct = Math.max((cnt / maxCnt) * 100, 2);
+      const errPct = cnt > 0 ? Math.max((errs / maxCnt) * 100, 0) : 0;
+      const title = (i) + 'h前: ' + cnt + '请求' + (errs ? ', ' + errs + '错误' : '');
+      html += '<div class="flex-1 flex flex-col justify-end" title="' + title + '">';
+      if (errPct > 0) html += '<div class="bg-red-400 rounded-t" style="height:' + errPct + '%"></div>';
+      html += '<div class="bg-blue-400 ' + (errPct > 0 ? '' : 'rounded-t') + ' rounded-b" style="height:' + (pct - errPct) + '%"></div>';
+      html += '</div>';
+    }
+    html += '</div><div class="flex justify-between text-xs text-gray-400 mt-1"><span>24h前</span><span>现在</span></div></div>';
+  }
+
+  // two-column layout: top models + channel stats
+  html += '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+
+  // top models
+  html += '<div class="bg-white rounded-lg shadow-sm border p-4">'
+    + '<h3 class="text-sm font-semibold text-gray-700 mb-3">热门模型 (24h)</h3>';
+  const tm = r.topModels || [];
+  if (tm.length > 0) {
+    html += '<div class="space-y-2">';
+    for (const m of tm) {
+      const rate = m.cnt > 0 ? Math.round(m.ok / m.cnt * 100) : 0;
+      const barW = Math.max(Math.round(m.cnt / (tm[0].cnt || 1) * 100), 5);
+      html += '<div>'
+        + '<div class="flex justify-between text-xs mb-0.5"><span class="font-mono text-gray-700 truncate max-w-[200px]" title="' + esc(m.model) + '">' + esc(m.model) + '</span>'
+        + '<span class="text-gray-500 whitespace-nowrap ml-2">' + m.cnt + '次 · ' + Math.round(m.avg_ms) + 'ms · ' + rate + '%</span></div>'
+        + '<div class="w-full bg-gray-100 rounded-full h-1.5"><div class="h-1.5 rounded-full ' + (rate >= 90 ? 'bg-blue-500' : rate >= 70 ? 'bg-orange-400' : 'bg-red-400') + '" style="width:' + barW + '%"></div></div></div>';
+    }
+    html += '</div>';
+  } else {
+    html += '<p class="text-sm text-gray-400">暂无数据</p>';
+  }
+  html += '</div>';
+
+  // channel stats
+  html += '<div class="bg-white rounded-lg shadow-sm border p-4">'
+    + '<h3 class="text-sm font-semibold text-gray-700 mb-3">渠道使用情况 (24h)</h3>';
+  const cs = r.channelStats || [];
+  if (cs.length > 0) {
+    html += '<div class="space-y-2">';
+    for (const c of cs) {
+      const rate = c.cnt > 0 ? Math.round(c.ok / c.cnt * 100) : 0;
+      const barW = Math.max(Math.round(c.cnt / (cs[0].cnt || 1) * 100), 5);
+      html += '<div>'
+        + '<div class="flex justify-between text-xs mb-0.5"><span class="font-medium text-gray-700">' + esc(c.channel_name) + '</span>'
+        + '<span class="text-gray-500">' + c.cnt + '次 · ' + Math.round(c.avg_ms) + 'ms · 成功率 ' + rate + '%</span></div>'
+        + '<div class="w-full bg-gray-100 rounded-full h-1.5"><div class="h-1.5 rounded-full ' + (rate >= 90 ? 'bg-green-500' : rate >= 70 ? 'bg-orange-400' : 'bg-red-400') + '" style="width:' + barW + '%"></div></div></div>';
+    }
+    html += '</div>';
+  } else {
+    html += '<p class="text-sm text-gray-400">暂无数据</p>';
+  }
+  html += '</div>';
+
+  html += '</div>'; // end two-column
+
+  // token activity
+  const tt = r.topTokens || [];
+  if (tt.length > 0) {
+    html += '<div class="bg-white rounded-lg shadow-sm border p-4">'
+      + '<h3 class="text-sm font-semibold text-gray-700 mb-3">令牌活动 (24h)</h3>'
+      + '<div class="grid grid-cols-2 md:grid-cols-5 gap-3">';
+    for (const t of tt) {
+      const rate = t.cnt > 0 ? Math.round(t.ok / t.cnt * 100) : 0;
+      html += '<div class="text-center p-2 rounded border">'
+        + '<div class="text-sm font-medium">' + esc(t.token_name) + '</div>'
+        + '<div class="text-lg font-bold text-blue-600">' + t.cnt + '</div>'
+        + '<div class="text-xs text-gray-500">成功率 ' + rate + '%</div></div>';
+    }
+    html += '</div></div>';
+  }
+
+  // recent activity
+  const logs = r.recentLogs || [];
+  if (logs.length > 0) {
+    html += '<div class="bg-white rounded-lg shadow-sm border p-4">'
+      + '<h3 class="text-sm font-semibold text-gray-700 mb-3">最近请求</h3>'
+      + '<div class="space-y-1">';
+    for (const l of logs) {
+      const sc = l.status_code || 0;
+      const scCls = sc >= 500 ? 'text-red-600' : sc >= 400 ? 'text-orange-500' : 'text-green-600';
+      const time = ts(l.created_at);
+      html += '<div class="flex items-center gap-3 text-xs py-1.5 border-b border-gray-50">'
+        + '<span class="text-gray-400 w-36 shrink-0">' + time + '</span>'
+        + '<span class="font-medium w-16 shrink-0">' + esc(l.token_name || '-') + '</span>'
+        + '<span class="font-mono text-blue-700 truncate max-w-[200px]" title="' + esc(l.model_used || '') + '">' + esc(l.model_used || 'auto') + '</span>'
+        + '<span class="text-gray-500">→</span>'
+        + '<span class="text-purple-600">' + esc(l.channel_name || '-') + '</span>'
+        + '<span class="' + scCls + ' font-medium">' + sc + '</span>'
+        + '<span class="text-gray-400">' + (l.latency_ms || 0) + 'ms</span>'
+        + (l.error ? '<span class="text-red-400 truncate max-w-[150px]" title="' + esc(l.error) + '">' + esc(l.error.slice(0,40)) + '</span>' : '')
+        + '</div>';
+    }
+    html += '</div></div>';
+  }
+
+  html += '</div>';
+  $('content').innerHTML = html;
+}
+
 // ─── Render ───
 async function render() {
   loadStats();
-  if (currentTab === 'channels') renderChannels();
+  if (currentTab === 'dashboard') renderDashboard();
+  else if (currentTab === 'channels') renderChannels();
   else if (currentTab === 'models') renderModels();
   else if (currentTab === 'tokens') renderTokens();
   else if (currentTab === 'routing') renderRouting();
