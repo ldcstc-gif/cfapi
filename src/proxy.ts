@@ -97,15 +97,21 @@ proxy.get('/v1/models', async (c) => {
   const token = await authenticateToken(db, c.req.header('Authorization') || '')
   if (!token) return c.json({ error: { message: '未提供令牌或令牌无效', type: 'auth_error' } }, 401)
   const models = await getEnabledModels(db)
-  const data: { id: string; object: string; created: number; owned_by: string }[] =
-    models.map(m => ({ id: m, object: 'model', created: 0, owned_by: 'api-router' }))
+  const entry = (id: string) => ({ id, object: 'model' as const, created: 0, owned_by: 'api-router' })
+  const data = models.map(m => entry(m))
+  data.unshift(entry('auto'))
   const prefixed = await db.prepare(
-    `SELECT DISTINCT c.prefix || ':' || a.model as pm
+    `SELECT DISTINCT c.prefix || ':' || a.model as pm, c.prefix
      FROM abilities a JOIN channels c ON a.channel_id = c.id
-     WHERE c.prefix != '' AND c.prefix IS NOT NULL AND a.enabled = 1`
-  ).all<{ pm: string }>()
+     WHERE c.prefix != '' AND c.prefix IS NOT NULL AND a.enabled = 1 AND c.status = 1`
+  ).all<{ pm: string; prefix: string }>()
+  const prefixes = new Set<string>()
   for (const p of prefixed.results) {
-    data.push({ id: p.pm, object: 'model', created: 0, owned_by: 'api-router' })
+    data.push(entry(p.pm))
+    prefixes.add(p.prefix)
+  }
+  for (const px of prefixes) {
+    data.push(entry(px + ':auto'))
   }
   return c.json({ object: 'list', data })
 })
@@ -131,29 +137,14 @@ proxy.all('/v1/*', async (c) => {
   } catch { /* not JSON */ }
 
   const clientModel = (bodyData?.model || '').toString().trim()
-  const isAuto = !clientModel || clientModel.toLowerCase() === 'auto'
+  let isAuto = !clientModel || clientModel.toLowerCase() === 'auto'
 
   let targetModel = clientModel
   let category: string | null = null
-
-  if (isAuto) {
-    if (token.pinned_model) {
-      targetModel = token.pinned_model
-    } else {
-      const config = await getConfig(db)
-      const enabledModels = await getEnabledModels(db, chFilter)
-      const freeModels = await getFreeModels(db, chFilter)
-      const strategy = token.strategy || 'smart'
-      const pick = pickModel(path, bodyData, enabledModels, config, strategy, freeModels)
-      targetModel = pick.model || ''
-      category = pick.category
-    }
-    if (!targetModel) return c.json({ error: { message: '没有可用的模型', type: 'routing_error' } }, 503)
-  }
-
-  // Resolve channel prefix: "prefix:actual_model" → force specific channel
   let forcedChannel: Channel | null = null
-  if (targetModel.includes(':')) {
+
+  // Handle "prefix:model" — parse before auto-routing so "prefix:auto" works
+  if (!isAuto && targetModel.includes(':')) {
     const idx = targetModel.indexOf(':')
     const prefix = targetModel.slice(0, idx)
     const actualModel = targetModel.slice(idx + 1)
@@ -164,8 +155,28 @@ proxy.all('/v1/*', async (c) => {
       if (ch) {
         forcedChannel = ch
         targetModel = actualModel
+        if (targetModel.toLowerCase() === 'auto') {
+          isAuto = true
+        }
       }
     }
+  }
+
+  if (isAuto) {
+    const autoChFilter = forcedChannel ? [forcedChannel.prefix] : chFilter
+    if (token.pinned_model && !forcedChannel) {
+      targetModel = token.pinned_model
+    } else {
+      const config = await getConfig(db)
+      const enabledModels = await getEnabledModels(db, autoChFilter)
+      const freeModels = await getFreeModels(db, autoChFilter)
+      const strategy = token.strategy || 'smart'
+      const pick = pickModel(path, bodyData, enabledModels, config, strategy, freeModels)
+      targetModel = pick.model || ''
+      category = pick.category
+    }
+    if (!targetModel) return c.json({ error: { message: '没有可用的模型', type: 'routing_error' } }, 503)
+    forcedChannel = null
   }
 
   if (token.models) {
