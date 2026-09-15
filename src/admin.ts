@@ -142,7 +142,7 @@ async function generateUniquePrefix(db: D1Database, name: string, excludeId?: nu
 
 admin.get('/api/channels', async (c) => {
   const rows = await c.env.DB.prepare(
-    "SELECT id, name, COALESCE(prefix,'') as prefix, base_url, api_key, models, COALESCE(free_models,'') as free_models, status, priority, created_at, updated_at FROM channels ORDER BY id"
+    "SELECT id, name, COALESCE(prefix,'') as prefix, base_url, api_key, models, COALESCE(free_models,'') as free_models, COALESCE(balance_url,'') as balance_url, COALESCE(balance_field,'') as balance_field, COALESCE(balance_unit,'') as balance_unit, status, priority, created_at, updated_at FROM channels ORDER BY id"
   ).all<Channel>()
   return c.json({ success: true, data: rows.results })
 })
@@ -169,6 +169,9 @@ admin.put('/api/channels/:id', async (c) => {
   if (body.api_key !== undefined) { sets.push('api_key = ?'); vals.push(body.api_key) }
   if (body.models !== undefined) { sets.push('models = ?'); vals.push(body.models) }
   if ((body as any).free_models !== undefined) { sets.push('free_models = ?'); vals.push((body as any).free_models) }
+  if (body.balance_url !== undefined) { sets.push('balance_url = ?'); vals.push(body.balance_url) }
+  if (body.balance_field !== undefined) { sets.push('balance_field = ?'); vals.push(body.balance_field) }
+  if (body.balance_unit !== undefined) { sets.push('balance_unit = ?'); vals.push(body.balance_unit) }
   if (body.status !== undefined) { sets.push('status = ?'); vals.push(body.status) }
   if (body.priority !== undefined) { sets.push('priority = ?'); vals.push(body.priority) }
   sets.push('updated_at = unixepoch()')
@@ -224,6 +227,125 @@ admin.post('/api/channels/:id/sync-models', async (c) => {
   } catch (e: any) {
     return c.json({ success: false, error: e.message })
   }
+})
+
+// ─── Balance ───
+
+const BALANCE_PRESETS: Record<string, { url: string; field: string; unit: string }> = {
+  'deepseek': { url: '/user/balance', field: 'balance_infos.0.total_balance', unit: '元' },
+  'openrouter': { url: '/api/v1/auth/key', field: 'data.usage', unit: '$ 已用' },
+}
+
+function detectPreset(baseUrl: string): { url: string; field: string; unit: string } | null {
+  const lower = baseUrl.toLowerCase()
+  for (const [key, preset] of Object.entries(BALANCE_PRESETS)) {
+    if (lower.includes(key)) return preset
+  }
+  return null
+}
+
+function resolveField(obj: any, path: string): any {
+  const parts = path.split('.')
+  let cur = obj
+  for (const p of parts) {
+    if (cur == null) return null
+    cur = /^\d+$/.test(p) ? cur[Number(p)] : cur[p]
+  }
+  return cur
+}
+
+async function checkChannelBalance(ch: Channel): Promise<{ balance: string; unit: string } | null> {
+  const preset = detectPreset(ch.base_url)
+  const balUrl = ch.balance_url || preset?.url || ''
+  const balField = ch.balance_field || preset?.field || ''
+  const balUnit = ch.balance_unit || preset?.unit || ''
+  if (!balUrl) return null
+
+  const key = ch.api_key.split('\n')[0].trim()
+  const base = ch.base_url.replace(/\/+$/, '')
+  let fetchUrl: string
+  try {
+    const origin = new URL(base).origin
+    fetchUrl = origin + balUrl
+  } catch { return null }
+  try {
+    const resp = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${key}` } })
+    if (!resp.ok) return null
+    const data = await resp.json()
+    const val = balField ? resolveField(data, balField) : null
+    if (val == null) return null
+    return { balance: String(val), unit: balUnit }
+  } catch {
+    return null
+  }
+}
+
+admin.post('/api/channels/:id/check-balance', async (c) => {
+  const id = Number(c.req.param('id'))
+  const ch = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<Channel>()
+  if (!ch) return c.json({ success: false, error: '渠道不存在' }, 404)
+
+  const preset = detectPreset(ch.base_url)
+  const balUrl = ch.balance_url || preset?.url || ''
+  if (!balUrl) return c.json({ success: false, error: '该渠道无余额接口配置，也不在预设列表中' })
+
+  const key = ch.api_key.split('\n')[0].trim()
+  let fetchUrl: string
+  try { fetchUrl = new URL(ch.base_url.replace(/\/+$/, '')).origin + balUrl } catch { return c.json({ success: false, error: 'base_url 解析失败' }) }
+
+  let rawResp: string
+  let rawStatus: number
+  try {
+    const resp = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${key}` } })
+    rawStatus = resp.status
+    rawResp = await resp.text()
+  } catch (e: any) {
+    return c.json({ success: false, error: '请求失败: ' + e.message, url: fetchUrl })
+  }
+
+  const balField = ch.balance_field || preset?.field || ''
+  let parsed: any
+  try { parsed = JSON.parse(rawResp) } catch { return c.json({ success: false, error: '响应非JSON', status: rawStatus, url: fetchUrl, body: rawResp.slice(0, 500) }) }
+
+  const val = balField ? resolveField(parsed, balField) : null
+
+  const result = await checkChannelBalance(ch)
+  if (!result) return c.json({ success: false, error: '字段解析失败', url: fetchUrl, status: rawStatus, field: balField, resolved: val, body: rawResp.slice(0, 500) })
+
+  await c.env.DB.prepare(
+    "INSERT INTO config (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).bind('balance:' + id, JSON.stringify({ ...result, checked_at: new Date().toISOString() })).run()
+
+  return c.json({ success: true, ...result })
+})
+
+admin.post('/api/check-all-balances', async (c) => {
+  const channels = await c.env.DB.prepare('SELECT * FROM channels WHERE status = 1').all<Channel>()
+  const results: { id: number; name: string; balance: string | null; unit: string; error?: string }[] = []
+  for (const ch of channels.results) {
+    const r = await checkChannelBalance(ch)
+    if (r) {
+      await c.env.DB.prepare(
+        "INSERT INTO config (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      ).bind('balance:' + ch.id, JSON.stringify({ ...r, checked_at: new Date().toISOString() })).run()
+      results.push({ id: ch.id, name: ch.name, balance: r.balance, unit: r.unit })
+    } else {
+      results.push({ id: ch.id, name: ch.name, balance: null, unit: '', error: '不支持或查询失败' })
+    }
+  }
+  return c.json({ success: true, results })
+})
+
+admin.get('/api/balances', async (c) => {
+  const rows = await c.env.DB.prepare(
+    "SELECT key, value FROM config WHERE key LIKE 'balance:%'"
+  ).all<{ key: string; value: string }>()
+  const map: Record<number, any> = {}
+  for (const r of rows.results) {
+    const id = Number(r.key.replace('balance:', ''))
+    try { map[id] = JSON.parse(r.value) } catch {}
+  }
+  return c.json({ success: true, data: map })
 })
 
 // ─── Tokens ───
@@ -461,6 +583,14 @@ admin.get('/api/dashboard', async (c) => {
 
   const lastSync = await db.prepare("SELECT value FROM config WHERE key = 'last_sync'").first<{ value: string }>()
 
+  const balRows = await db.prepare("SELECT key, value FROM config WHERE key LIKE 'balance:%'").all<{ key: string; value: string }>()
+  const balances: Record<number, any> = {}
+  for (const br of balRows.results) {
+    const cid = Number(br.key.replace('balance:', ''))
+    try { balances[cid] = JSON.parse(br.value) } catch {}
+  }
+  const chList = await db.prepare("SELECT id, name, COALESCE(prefix,'') as prefix FROM channels WHERE status = 1 ORDER BY priority DESC").all<{ id: number; name: string; prefix: string }>()
+
   return c.json({
     success: true,
     stats: {
@@ -479,6 +609,8 @@ admin.get('/api/dashboard', async (c) => {
     recentLogs: recentLogs.results,
     hourly: hourly.results,
     lastSync: lastSync ? JSON.parse(lastSync.value) : null,
+    balances,
+    channelList: chList.results,
   })
 })
 
@@ -486,7 +618,7 @@ admin.get('/api/dashboard', async (c) => {
 
 admin.post('/api/init', async (c) => {
   const sql = `
-    CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, models TEXT DEFAULT '', prefix TEXT DEFAULT '', free_models TEXT DEFAULT '', status INTEGER DEFAULT 1, priority INTEGER DEFAULT 0, created_at INTEGER DEFAULT (unixepoch()), updated_at INTEGER DEFAULT (unixepoch()));
+    CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, models TEXT DEFAULT '', prefix TEXT DEFAULT '', free_models TEXT DEFAULT '', balance_url TEXT DEFAULT '', balance_field TEXT DEFAULT '', balance_unit TEXT DEFAULT '', status INTEGER DEFAULT 1, priority INTEGER DEFAULT 0, created_at INTEGER DEFAULT (unixepoch()), updated_at INTEGER DEFAULT (unixepoch()));
     CREATE TABLE IF NOT EXISTS abilities (model TEXT NOT NULL, channel_id INTEGER NOT NULL, enabled INTEGER DEFAULT 1, priority INTEGER DEFAULT 0, PRIMARY KEY (model, channel_id));
     CREATE TABLE IF NOT EXISTS tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT DEFAULT '', key TEXT UNIQUE NOT NULL, status INTEGER DEFAULT 1, models TEXT DEFAULT '', strategy TEXT DEFAULT 'smart', pinned_model TEXT DEFAULT '', channels TEXT DEFAULT '', remark TEXT DEFAULT '', created_at INTEGER DEFAULT (unixepoch()));
     CREATE TABLE IF NOT EXISTS cooldowns (channel_id INTEGER NOT NULL, model TEXT NOT NULL, until_ts INTEGER NOT NULL, PRIMARY KEY (channel_id, model));
@@ -504,6 +636,9 @@ admin.post('/api/init', async (c) => {
     "ALTER TABLE channels ADD COLUMN free_models TEXT DEFAULT ''",
     "ALTER TABLE tokens ADD COLUMN channels TEXT DEFAULT ''",
     "ALTER TABLE tokens ADD COLUMN remark TEXT DEFAULT ''",
+    "ALTER TABLE channels ADD COLUMN balance_url TEXT DEFAULT ''",
+    "ALTER TABLE channels ADD COLUMN balance_field TEXT DEFAULT ''",
+    "ALTER TABLE channels ADD COLUMN balance_unit TEXT DEFAULT ''",
   ]
   for (const m of migrations) {
     try { await c.env.DB.prepare(m).run() } catch { /* already exists */ }
@@ -548,10 +683,23 @@ export async function handleScheduled(env: Env): Promise<{ synced: number; faile
     }
   }
   await db.prepare('DELETE FROM cooldowns WHERE until_ts < unixepoch()').run()
+  // check balances
+  let balanceChecked = 0
+  for (const ch of channels.results) {
+    try {
+      const r = await checkChannelBalance(ch)
+      if (r) {
+        await db.prepare(
+          "INSERT INTO config (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        ).bind('balance:' + ch.id, JSON.stringify({ ...r, checked_at: new Date().toISOString() })).run()
+        balanceChecked++
+      }
+    } catch { /* best effort */ }
+  }
   try {
     await db.prepare(
       "INSERT INTO config (key, value) VALUES ('last_sync', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-    ).bind(JSON.stringify({ time: new Date().toISOString(), synced, failed })).run()
+    ).bind(JSON.stringify({ time: new Date().toISOString(), synced, failed, balanceChecked })).run()
   } catch { /* best effort */ }
   return { synced, failed }
 }

@@ -151,6 +151,7 @@ async function renderChannels() {
       + '<button onclick="editChannel(' + ch.id + ')" class="text-blue-600 hover:underline text-xs">编辑</button>'
       + '<button onclick="testChannel(' + ch.id + ')" class="text-green-600 hover:underline text-xs">测试</button>'
       + '<button onclick="syncChannel(' + ch.id + ')" class="text-purple-600 hover:underline text-xs">同步模型</button>'
+      + '<button onclick="checkBalance(' + ch.id + ')" class="text-teal-600 hover:underline text-xs">余额</button>'
       + '<button onclick="toggleChannel(' + ch.id + ',' + ch.status + ')" class="text-orange-600 hover:underline text-xs">' + (ch.status === 1 ? '停用' : '启用') + '</button>'
       + '<button onclick="deleteChannel(' + ch.id + ')" class="text-red-500 hover:underline text-xs">删除</button>'
       + '</td></tr>';
@@ -160,7 +161,7 @@ async function renderChannels() {
 }
 
 function channelFormHtml(ch) {
-  const c = ch || { name: '', prefix: '', base_url: '', api_key: '', models: '', free_models: '', priority: 0 };
+  const c = ch || { name: '', prefix: '', base_url: '', api_key: '', models: '', free_models: '', balance_url: '', balance_field: '', balance_unit: '', priority: 0 };
   const title = ch ? '编辑渠道 #' + ch.id : '添加渠道';
   return '<h3 class="text-lg font-semibold mb-4">' + title + '</h3>'
     + '<div class="space-y-3">'
@@ -170,6 +171,14 @@ function channelFormHtml(ch) {
     + '<div><label class="block text-sm text-gray-600 mb-1">Base URL</label><input id="f_base_url" class="w-full border rounded px-3 py-2" value="' + esc(c.base_url) + '" placeholder="https://api.example.com/v1"></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">API Key（多个用换行分隔）</label><textarea id="f_api_key" class="w-full border rounded px-3 py-2 h-20 font-mono text-xs">' + esc(c.api_key || '') + '</textarea></div>'
     + '<div><label class="block text-sm text-gray-600 mb-1">模型列表（逗号分隔，或添加后点同步自动拉取）</label><textarea id="f_models" class="w-full border rounded px-3 py-2 h-20 font-mono text-xs">' + esc(c.models || '') + '</textarea></div>'
+    + '<details class="border rounded p-3"><summary class="text-sm font-medium text-gray-700 cursor-pointer">余额监控配置 <span class="text-gray-400 font-normal">（主流渠道自动识别，留空即可）</span></summary>'
+    + '<div class="mt-3 space-y-2">'
+    + '<p class="text-xs text-gray-400">SiliconFlow / DeepSeek / OpenRouter 自动识别，无需手动填写。其他渠道如需监控余额，请填写以下配置。</p>'
+    + '<div class="grid grid-cols-3 gap-2">'
+    + '<div><label class="block text-xs text-gray-500 mb-1">余额接口路径</label><input id="f_balance_url" class="w-full border rounded px-2 py-1.5 font-mono text-xs" value="' + esc(c.balance_url || '') + '" placeholder="/v1/user/info"></div>'
+    + '<div><label class="block text-xs text-gray-500 mb-1">余额字段路径</label><input id="f_balance_field" class="w-full border rounded px-2 py-1.5 font-mono text-xs" value="' + esc(c.balance_field || '') + '" placeholder="data.balance"></div>'
+    + '<div><label class="block text-xs text-gray-500 mb-1">单位</label><input id="f_balance_unit" class="w-full border rounded px-2 py-1.5 text-xs" value="' + esc(c.balance_unit || '') + '" placeholder="元"></div>'
+    + '</div></div></details>'
     + '<div><label class="block text-sm text-gray-600 mb-1">优先级</label><input id="f_priority" type="number" class="w-full border rounded px-3 py-2" value="' + (c.priority || 0) + '"></div>'
     + '<div class="flex gap-3 pt-2">'
     + '<button onclick="saveChannel(' + (ch ? ch.id : 'null') + ')" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">保存</button>'
@@ -184,7 +193,7 @@ window.editChannel = async (id) => {
   if (ch) showModal(channelFormHtml(ch));
 };
 window.saveChannel = async (id) => {
-  const data = { name: $('f_name').value, prefix: $('f_prefix').value, base_url: $('f_base_url').value, api_key: $('f_api_key').value, models: $('f_models').value, free_models: $('f_free_models').value.trim(), priority: Number($('f_priority').value) };
+  const data = { name: $('f_name').value, prefix: $('f_prefix').value, base_url: $('f_base_url').value, api_key: $('f_api_key').value, models: $('f_models').value, free_models: $('f_free_models').value.trim(), balance_url: $('f_balance_url').value.trim(), balance_field: $('f_balance_field').value.trim(), balance_unit: $('f_balance_unit').value.trim(), priority: Number($('f_priority').value) };
   if (id) await api('/channels/' + id, { method: 'PUT', body: JSON.stringify(data) });
   else await api('/channels', { method: 'POST', body: JSON.stringify(data) });
   closeModal(); render();
@@ -319,6 +328,19 @@ window.syncAllChannels = async () => {
     alert('同步完成：成功 ' + r.synced + ' 个，失败 ' + r.failed + ' 个');
     render();
   }
+};
+
+window.refreshAllBalances = async () => {
+  const btn = $('balRefreshBtn');
+  if (btn) { btn.textContent = '刷新中...'; btn.disabled = true; }
+  await api('/check-all-balances', { method: 'POST' });
+  if (btn) { btn.textContent = '刷新全部'; btn.disabled = false; }
+  render();
+};
+window.checkBalance = async (id) => {
+  const r = await api('/channels/' + id + '/check-balance', { method: 'POST' });
+  if (r.success) alert(r.balance + ' ' + r.unit);
+  else alert(r.error || '查询失败');
 };
 
 // ─── Tokens ───
@@ -542,6 +564,32 @@ async function renderDashboard() {
 
   // sync info
   html += '<div class="text-xs text-gray-400">' + esc(syncInfo) + '</div>';
+
+  // channel balances
+  const bals = r.balances || {};
+  const chList = r.channelList || [];
+  const hasBal = chList.some(c => bals[c.id]);
+  if (hasBal) {
+    html += '<div class="bg-white rounded-lg shadow-sm border p-4">'
+      + '<div class="flex justify-between items-center mb-3"><h3 class="text-sm font-semibold text-gray-700">渠道余额</h3>'
+      + '<button onclick="refreshAllBalances()" id="balRefreshBtn" class="text-xs text-blue-600 hover:underline">刷新全部</button></div>'
+      + '<div class="grid grid-cols-2 md:grid-cols-4 gap-3">';
+    for (const ch of chList) {
+      const b = bals[ch.id];
+      if (!b) continue;
+      const val = parseFloat(b.balance);
+      const isLow = !isNaN(val) && val < 1;
+      const color = isLow ? 'red' : val < 10 ? 'orange' : 'green';
+      const timeAgo = b.checked_at ? b.checked_at.replace('T',' ').slice(5,16) : '';
+      html += '<div class="p-3 rounded-lg border ' + (isLow ? 'border-red-300 bg-red-50' : 'border-gray-200') + '">'
+        + '<div class="text-xs text-gray-500 flex items-center gap-1"><span class="font-mono text-purple-600">[' + esc(ch.prefix) + ']</span> ' + esc(ch.name) + '</div>'
+        + '<div class="text-xl font-bold text-' + color + '-600 mt-1">' + esc(b.balance) + ' <span class="text-sm font-normal">' + esc(b.unit) + '</span></div>'
+        + (isLow ? '<div class="text-xs text-red-500 mt-0.5">⚠ 余额不足</div>' : '')
+        + '<div class="text-xs text-gray-400 mt-0.5">' + timeAgo + '</div>'
+        + '</div>';
+    }
+    html += '</div></div>';
+  }
 
   // 24h hourly chart (simple bar)
   const hourly = r.hourly || [];

@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import type { Env, Channel } from './types'
 import {
-  getConfig, getEnabledModels, getFreeModels, pickModel, selectChannel,
+  getConfig, getEnabledModels, getFreeModels, pickModelCandidates, selectAllChannels,
   setCooldown, cleanCooldowns,
 } from './routing'
 
@@ -139,82 +139,103 @@ proxy.all('/v1/*', async (c) => {
   const clientModel = (bodyData?.model || '').toString().trim()
   let isAuto = !clientModel || clientModel.toLowerCase() === 'auto'
 
-  let targetModel = clientModel
-  let category: string | null = null
+  let baseModel = clientModel
   let forcedChannel: Channel | null = null
 
   // Handle "prefix:model" — parse before auto-routing so "prefix:auto" works
-  if (!isAuto && targetModel.includes(':')) {
-    const idx = targetModel.indexOf(':')
-    const prefix = targetModel.slice(0, idx)
-    const actualModel = targetModel.slice(idx + 1)
+  if (!isAuto && baseModel.includes(':')) {
+    const idx = baseModel.indexOf(':')
+    const prefix = baseModel.slice(0, idx)
+    const actualModel = baseModel.slice(idx + 1)
     if (prefix && actualModel) {
       const ch = await db.prepare(
         "SELECT * FROM channels WHERE prefix = ? LIMIT 1"
       ).bind(prefix).first<Channel>()
       if (ch) {
         forcedChannel = ch
-        targetModel = actualModel
-        if (targetModel.toLowerCase() === 'auto') {
-          isAuto = true
-        }
+        baseModel = actualModel
+        if (actualModel.toLowerCase() === 'auto') isAuto = true
       }
     }
   }
 
+  // Build ordered candidate model list
+  let candidateModels: string[] = []
+  const effectiveFilter = forcedChannel ? [forcedChannel.prefix] : chFilter
   if (isAuto) {
-    const autoChFilter = forcedChannel ? [forcedChannel.prefix] : chFilter
     if (token.pinned_model && !forcedChannel) {
-      targetModel = token.pinned_model
+      candidateModels = [token.pinned_model]
     } else {
       const config = await getConfig(db)
-      const enabledModels = await getEnabledModels(db, autoChFilter)
-      const freeModels = await getFreeModels(db, autoChFilter)
+      const enabledModels = await getEnabledModels(db, effectiveFilter)
+      const freeModels = await getFreeModels(db, effectiveFilter)
       const strategy = token.strategy || 'smart'
-      const pick = pickModel(path, bodyData, enabledModels, config, strategy, freeModels)
-      targetModel = pick.model || ''
-      category = pick.category
+      candidateModels = pickModelCandidates(path, bodyData, enabledModels, config, strategy, freeModels).models
     }
-    if (!targetModel) return c.json({ error: { message: '没有可用的模型', type: 'routing_error' } }, 503)
-    forcedChannel = null
+  } else {
+    candidateModels = [baseModel]
   }
 
+  // Token model whitelist
   if (token.models) {
     const allowed = token.models.split(',').map(m => m.trim()).filter(Boolean)
-    if (allowed.length > 0 && !allowed.includes(targetModel)) {
-      return c.json({ error: { message: `令牌不允许访问模型 ${targetModel}`, type: 'auth_error' } }, 403)
+    if (allowed.length > 0) {
+      candidateModels = candidateModels.filter(m => allowed.includes(m))
+      if (candidateModels.length === 0) {
+        return c.json({ error: { message: '令牌不允许访问请求的模型', type: 'auth_error' } }, 403)
+      }
     }
   }
-
-  const channel = forcedChannel || await selectChannel(db, targetModel, chFilter)
-  if (!channel) {
-    return c.json({ error: { message: `没有渠道提供模型 ${targetModel}`, type: 'routing_error' } }, 503)
+  if (candidateModels.length === 0) {
+    return c.json({ error: { message: '没有可用的模型', type: 'routing_error' } }, 503)
   }
 
-  const injectModel = (isAuto || forcedChannel) ? targetModel : null
-  const resp = await forwardToChannel(c.req.raw, channel, path, body, injectModel)
+  // Build failover chain: up to 2 channels per model, capped total
+  const MAX_ATTEMPTS = 4
+  const attempts: { model: string; channel: Channel }[] = []
+  for (const m of candidateModels) {
+    const channels = forcedChannel ? [forcedChannel] : await selectAllChannels(db, m, chFilter)
+    let perModel = 0
+    for (const ch of channels) {
+      attempts.push({ model: m, channel: ch })
+      if (++perModel >= 2 || attempts.length >= MAX_ATTEMPTS) break
+    }
+    if (attempts.length >= MAX_ATTEMPTS) break
+  }
+  if (attempts.length === 0) {
+    return c.json({ error: { message: `没有渠道提供请求的模型`, type: 'routing_error' } }, 503)
+  }
 
-  if (resp.status === 429) {
-    c.executionCtx.waitUntil(setCooldown(db, channel.id, targetModel, 60))
-    const retryChannel = forcedChannel ? null : await selectChannel(db, targetModel, chFilter)
-    if (retryChannel && retryChannel.id !== channel.id) {
-      const retryResp = await forwardToChannel(c.req.raw, retryChannel, path, body, injectModel)
+  // Try each candidate until success or non-retryable error or exhausted
+  const RETRYABLE = new Set([402, 403, 408, 409, 429, 500, 502, 503, 504])
+  for (let i = 0; i < attempts.length; i++) {
+    const { model, channel } = attempts[i]
+    const injectModel = model !== clientModel ? model : null
+    const resp = await forwardToChannel(c.req.raw, channel, path, body, injectModel)
+    const isLast = i === attempts.length - 1
+    const retryable = RETRYABLE.has(resp.status)
+
+    if (resp.status < 400 || !retryable || isLast) {
       const latency = Date.now() - started
-      c.executionCtx.waitUntil(
-        logRequest(db, token.name, path, clientModel, targetModel, retryChannel.id, retryChannel.name, retryResp.status, latency, retryResp.status >= 400 ? `retry after 429 from ${channel.name}` : '')
-      )
-      return retryResp
+      let errorText = ''
+      if (resp.status >= 400) {
+        try { errorText = (await resp.clone().text()).slice(0, 500) } catch { /* ignore */ }
+      }
+      const note = i > 0 ? `failover#${i + 1} ` : ''
+      c.executionCtx.waitUntil(logRequest(db, token.name, path, clientModel, model, channel.id, channel.name, resp.status, latency, (note + errorText).trim()))
+      c.executionCtx.waitUntil(cleanCooldowns(db))
+      return resp
     }
+
+    // Retryable failure → cooldown this channel/model, log, move to next
+    const cd = resp.status === 429 ? 60 : (resp.status === 403 || resp.status === 402) ? 300 : 30
+    c.executionCtx.waitUntil(setCooldown(db, channel.id, model, cd))
+    let errText = ''
+    try { errText = (await resp.clone().text()).slice(0, 200) } catch { /* ignore */ }
+    c.executionCtx.waitUntil(logRequest(db, token.name, path, clientModel, model, channel.id, channel.name, resp.status, Date.now() - started, `try#${i + 1}切换: ${errText}`))
   }
 
-  const latency = Date.now() - started
-  let errorText = ''
-  if (resp.status >= 400 && resp.status !== 429) {
-    try { errorText = (await resp.clone().text()).slice(0, 500) } catch { /* ignore */ }
-  }
-  c.executionCtx.waitUntil(logRequest(db, token.name, path, clientModel, targetModel, channel.id, channel.name, resp.status, latency, errorText))
-  c.executionCtx.waitUntil(cleanCooldowns(db))
-  return resp
+  return c.json({ error: { message: '所有候选渠道均失败', type: 'routing_error' } }, 503)
 })
 
 export { proxy }

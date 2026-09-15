@@ -316,6 +316,42 @@ export function pickModel(
   return { model: null, category: null }
 }
 
+// Return an ordered list of candidate models for failover (best first, deduped).
+export function pickModelCandidates(
+  path: string,
+  body: any,
+  enabledModels: string[],
+  config: CategoryConfig,
+  strategy: string = 'smart',
+  freeModels: Set<string> = new Set(),
+  limit: number = 6,
+): { models: string[]; category: string | null } {
+  const collect = (cats: string[]): string[] => {
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const cat of cats) {
+      const pool = categoryPool(cat, enabledModels, config)
+      const ranked = rankModels(cat, pool, config, strategy, freeModels)
+      for (const m of ranked) {
+        if (!seen.has(m)) { seen.add(m); out.push(m) }
+        if (out.length >= limit) return out
+      }
+    }
+    return out
+  }
+  if (path.startsWith('/v1/chat/completions')) {
+    const category = classify(body?.messages || [], config)
+    return { models: collect([category, 'general', 'fast']), category }
+  }
+  if (path.startsWith('/v1/images/generations')) {
+    return { models: collect(['image']), category: 'image' }
+  }
+  if (path.startsWith('/v1/embeddings')) {
+    return { models: collect(['embedding']), category: 'embedding' }
+  }
+  return { models: [], category: null }
+}
+
 // ─── Category overview (for admin UI) ───
 
 export function getCategoryOverview(
@@ -345,7 +381,7 @@ export function getCategoryOverview(
 
 // ─── Channel selection ───
 
-export async function selectChannel(db: D1Database, model: string, channelPrefixes?: string[]): Promise<Channel | null> {
+export async function selectAllChannels(db: D1Database, model: string, channelPrefixes?: string[]): Promise<Channel[]> {
   const now = Math.floor(Date.now() / 1000)
   let sql = `
     SELECT c.* FROM channels c
@@ -357,9 +393,15 @@ export async function selectChannel(db: D1Database, model: string, channelPrefix
     sql += ` AND c.prefix IN (${channelPrefixes.map(() => '?').join(',')})`
     binds.push(...channelPrefixes)
   }
-  sql += ` ORDER BY (cd.until_ts IS NULL) DESC, a.priority DESC, c.priority DESC LIMIT 1`
-  const row = await db.prepare(sql).bind(...binds).first<Channel>()
-  return row || null
+  // channels not in cooldown first, then by priority
+  sql += ` ORDER BY (cd.until_ts IS NULL) DESC, a.priority DESC, c.priority DESC`
+  const rows = await db.prepare(sql).bind(...binds).all<Channel>()
+  return rows.results
+}
+
+export async function selectChannel(db: D1Database, model: string, channelPrefixes?: string[]): Promise<Channel | null> {
+  const all = await selectAllChannels(db, model, channelPrefixes)
+  return all[0] || null
 }
 
 export async function setCooldown(db: D1Database, channelId: number, model: string, seconds: number): Promise<void> {
