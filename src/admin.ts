@@ -231,12 +231,15 @@ admin.post('/api/channels/:id/sync-models', async (c) => {
 
 // ─── Balance ───
 
-const BALANCE_PRESETS: Record<string, { url: string; field: string; unit: string }> = {
+interface BalancePreset { url: string; field: string; unit: string; minus?: string }
+
+const BALANCE_PRESETS: Record<string, BalancePreset> = {
   'deepseek': { url: '/user/balance', field: 'balance_infos.0.total_balance', unit: '元' },
-  'openrouter': { url: '/api/v1/auth/key', field: 'data.usage', unit: '$ 已用' },
+  // 剩余余额 = 总额度 - 已用
+  'openrouter': { url: '/api/v1/credits', field: 'data.total_credits', minus: 'data.total_usage', unit: '$' },
 }
 
-function detectPreset(baseUrl: string): { url: string; field: string; unit: string } | null {
+function detectPreset(baseUrl: string): BalancePreset | null {
   const lower = baseUrl.toLowerCase()
   for (const [key, preset] of Object.entries(BALANCE_PRESETS)) {
     if (lower.includes(key)) return preset
@@ -254,30 +257,56 @@ function resolveField(obj: any, path: string): any {
   return cur
 }
 
-async function checkChannelBalance(ch: Channel): Promise<{ balance: string; unit: string } | null> {
+// Resolve effective balance query config: manual overrides win, else preset.
+function balanceConfig(ch: Channel): { url: string; field: string; unit: string; minus: string } | null {
   const preset = detectPreset(ch.base_url)
-  const balUrl = ch.balance_url || preset?.url || ''
-  const balField = ch.balance_field || preset?.field || ''
-  const balUnit = ch.balance_unit || preset?.unit || ''
-  if (!balUrl) return null
+  const url = ch.balance_url || preset?.url || ''
+  if (!url) return null
+  const usePreset = !ch.balance_url
+  return {
+    url,
+    field: ch.balance_field || preset?.field || '',
+    unit: ch.balance_unit || preset?.unit || '',
+    minus: usePreset ? (preset?.minus || '') : '',
+  }
+}
+
+interface BalanceResult { balance: string; unit: string }
+interface BalanceDiag { url: string; status?: number; body?: string; resolved?: any; error: string }
+
+async function fetchChannelBalance(ch: Channel): Promise<{ ok: BalanceResult } | { diag: BalanceDiag }> {
+  const cfg = balanceConfig(ch)
+  if (!cfg) return { diag: { url: '', error: '该渠道无余额接口配置，也不在预设列表中' } }
 
   const key = ch.api_key.split('\n')[0].trim()
-  const base = ch.base_url.replace(/\/+$/, '')
   let fetchUrl: string
-  try {
-    const origin = new URL(base).origin
-    fetchUrl = origin + balUrl
-  } catch { return null }
+  try { fetchUrl = new URL(ch.base_url.replace(/\/+$/, '')).origin + cfg.url } catch { return { diag: { url: cfg.url, error: 'base_url 解析失败' } } }
+
+  let raw: string, status: number
   try {
     const resp = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${key}` } })
-    if (!resp.ok) return null
-    const data = await resp.json()
-    const val = balField ? resolveField(data, balField) : null
-    if (val == null) return null
-    return { balance: String(val), unit: balUnit }
-  } catch {
-    return null
+    status = resp.status
+    raw = await resp.text()
+  } catch (e: any) {
+    return { diag: { url: fetchUrl, error: '请求失败: ' + e.message } }
   }
+
+  let parsed: any
+  try { parsed = JSON.parse(raw) } catch { return { diag: { url: fetchUrl, status, body: raw.slice(0, 500), error: '响应非JSON（可能是 key 失效或接口错误）' } } }
+
+  let val = cfg.field ? resolveField(parsed, cfg.field) : null
+  if (val == null) return { diag: { url: fetchUrl, status, resolved: null, body: raw.slice(0, 500), error: '字段解析失败（key 可能失效或字段路径不对）' } }
+  if (cfg.minus) {
+    const used = resolveField(parsed, cfg.minus)
+    val = Number(val) - Number(used || 0)
+  }
+  return { ok: { balance: String(val), unit: cfg.unit } }
+}
+
+// Simple wrapper for scheduled/batch use.
+async function checkChannelBalance(ch: Channel): Promise<BalanceResult | null> {
+  const r = await fetchChannelBalance(ch)
+  return 'ok' in r ? r.ok : null
 }
 
 admin.post('/api/channels/:id/check-balance', async (c) => {
@@ -285,38 +314,14 @@ admin.post('/api/channels/:id/check-balance', async (c) => {
   const ch = await c.env.DB.prepare('SELECT * FROM channels WHERE id = ?').bind(id).first<Channel>()
   if (!ch) return c.json({ success: false, error: '渠道不存在' }, 404)
 
-  const preset = detectPreset(ch.base_url)
-  const balUrl = ch.balance_url || preset?.url || ''
-  if (!balUrl) return c.json({ success: false, error: '该渠道无余额接口配置，也不在预设列表中' })
-
-  const key = ch.api_key.split('\n')[0].trim()
-  let fetchUrl: string
-  try { fetchUrl = new URL(ch.base_url.replace(/\/+$/, '')).origin + balUrl } catch { return c.json({ success: false, error: 'base_url 解析失败' }) }
-
-  let rawResp: string
-  let rawStatus: number
-  try {
-    const resp = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${key}` } })
-    rawStatus = resp.status
-    rawResp = await resp.text()
-  } catch (e: any) {
-    return c.json({ success: false, error: '请求失败: ' + e.message, url: fetchUrl })
-  }
-
-  const balField = ch.balance_field || preset?.field || ''
-  let parsed: any
-  try { parsed = JSON.parse(rawResp) } catch { return c.json({ success: false, error: '响应非JSON', status: rawStatus, url: fetchUrl, body: rawResp.slice(0, 500) }) }
-
-  const val = balField ? resolveField(parsed, balField) : null
-
-  const result = await checkChannelBalance(ch)
-  if (!result) return c.json({ success: false, error: '字段解析失败', url: fetchUrl, status: rawStatus, field: balField, resolved: val, body: rawResp.slice(0, 500) })
+  const r = await fetchChannelBalance(ch)
+  if ('diag' in r) return c.json({ success: false, ...r.diag })
 
   await c.env.DB.prepare(
     "INSERT INTO config (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-  ).bind('balance:' + id, JSON.stringify({ ...result, checked_at: new Date().toISOString() })).run()
+  ).bind('balance:' + id, JSON.stringify({ ...r.ok, checked_at: new Date().toISOString() })).run()
 
-  return c.json({ success: true, ...result })
+  return c.json({ success: true, ...r.ok })
 })
 
 admin.post('/api/check-all-balances', async (c) => {
