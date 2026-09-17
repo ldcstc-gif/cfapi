@@ -12,9 +12,6 @@ export interface Channel {
   api_key: string
   models: string
   free_models: string
-  balance_url: string
-  balance_field: string
-  balance_unit: string
   status: number
   priority: number
   created_at: number
